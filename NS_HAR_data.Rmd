@@ -1,0 +1,44 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(quantmod)
+```
+```{r}
+getSymbols("ZN=F", src = "yahoo", from = "2010-01-01", auto.assign = TRUE) # 10 year bond future
+getSymbols("ZF=F", src = "yahoo", from = "2010-01-01", auto.assign = TRUE) # 5 year bond future
+getSymbols("ZB=F", src = "yahoo", from = "2010-01-01", auto.assign = TRUE) # 30 year bond future
+getSymbols("ZT=F", src = "yahoo", from = "2010-01-01", auto.assign = TRUE) # 2 year bond future
+colSums(is.na(`ZN=F`))
+colSums(is.na(`ZF=F`))
+colSums(is.na(`ZB=F`))
+colSums(is.na(`ZT=F`))
+
+```
+
+
+```{r}
+BF_10 <- `ZN=F`[,6]
+BF_5 <- `ZF=F`[,6]
+BF_30 <- `ZB=F`[,6]
+BF_2 <- `ZT=F`[,6]
+
+BF_data <- cbind(BF_2, BF_5, BF_10, BF_30)
+colnames(BF_data) <- c("2 years", "5 years", "10 years", "30 years")
+head(BF_data)
+
+#write.csv(BF_data, "./Bond Future Data")
+```
+
+```{r}
+plot(BF_data, main = "Bond Futures Adjusted Prices", multi.panel = TRUE)
+
+```
+
+
+
+
+
+
+
