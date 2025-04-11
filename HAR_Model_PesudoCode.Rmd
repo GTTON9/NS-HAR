@@ -1,0 +1,160 @@
+---
+title: "Bond Future Data HAR Model"
+author: "Shawn Xiao"
+date: "2025-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(zoo)
+library(dplyr)
+library(visdat)
+library(tidyr)
+library(quantmod)
+library(tidyquant)
+library(ggplot2)
+```
+
+
+#Pulling Data and some data processing
+```{r pressure, echo=FALSE}
+
+# List of US Bond Futures (Symbol -> Description)
+
+# Yahoo Finance bond futures symbols and descriptions
+bond_futures_df <- data.frame(
+  Symbol = c("ZT=F", "Z3N=F", "ZF=F", "ZN=F", "TN=F", "TWE=F", "ZB=F", "UB=F"),
+  Description = c(
+    "2-Year Treasury Note Futures: Notes with 1y9m–2y maturity",
+    "3-Year Treasury Note Futures: Notes with 2y9m–3y maturity",
+    "5-Year Treasury Note Futures: Notes with 4y2m–5y3m maturity",
+    "10-Year Treasury Note Futures: Notes with 6y6m–8y maturity",
+    "Ultra 10-Year Treasury Note Futures: Notes with 9y5m–10y maturity",
+    "20-Year Treasury Bond Futures: Bonds with 19y2m–19y11m maturity",
+    "30-Year Treasury Bond Futures: Bonds with 15y+ maturity",
+    "Ultra 30-Year Treasury Bond Futures: Bonds with 25y+ maturity"
+  ),
+  row.names = c("ZT=F", "Z3N=F", "ZF=F", "ZN=F", "TN=F", "TWE=F", "ZB=F", "UB=F")
+)
+
+# View the data frame
+print(bond_futures_df)
+
+# Get bond futures
+bond_futures <- tq_get("ZB=F", from = "2005-01-01", to = Sys.Date())
+
+# Plot it
+ggplot(bond_futures, aes(x = date, y = adjusted)) +
+  geom_line() +
+  labs(title = "30-Year T-Bond Futures", x = "Date", y = "Adjusted Price")
+
+vis_miss(bond_futures)
+missing_values <- is.na(bond_futures) 
+
+#Missing Data due to US.Market Non-trading Day, best to carry on the previous day data
+
+bond_futures = bond_futures %>% fill(adjusted)
+  sum(is.na(bond_futures$adjusted))
+
+
+```
+
+#HAR Model Pesudo Code
+```{r}
+#Log Return
+bond_futures <- bond_futures %>%
+  mutate(
+    log_return = log(adjusted / lag(adjusted)),
+    RV = log_return
+  )
+
+#Since Log return, first value is output as 0)
+sum(is.na(bond_futures$log_return))
+length(bond_futures$adjusted)
+
+#Create HAR lag
+har_df <- bond_futures %>%
+  mutate(
+    RV_D = lag(RV, 1),
+    RV_W = rollmean(lag(RV, 1), k = 5, fill = NA, align = "right"),
+    RV_M = rollmean(lag(RV, 1), k = 22, fill = NA, align = "right")
+  ) %>%
+  drop_na()
+
+#Fit HAR model
+har_model <- lm(RV ~ RV_D + RV_W + RV_M, data = har_df)
+
+#Summary of model
+summary(har_model)
+
+#Add Prediction, since we are predicting, one month of data is being used to forecast at very start, so the dataframe start around Feb
+har_df <- har_df %>%
+  mutate(RV_hat = predict(har_model))
+
+ggplot(har_df, aes(x = date)) +
+  geom_line(aes(y = RV), color = "black", alpha = 0.6) +
+  geom_line(aes(y = RV_hat), color = "blue") +
+  labs(
+    title = "HAR Model: Actual vs Predicted Realized Variance",
+    y = "Squared Log Return (RV)", x = "Date"
+  )
+```
+
+```{r}
+#Log Return
+bond_futures <- bond_futures %>%
+  mutate(
+    log_return = log(adjusted / lag(adjusted)),
+    # Lacking Intrday Data, Wanna make a comparison of betweeen Orginial and daily proxy for realized variance using log return squared
+    RV = log_return^2 
+  )
+
+#Since Log return, first value is output as 0)
+sum(is.na(bond_futures$log_return))
+length(bond_futures$adjusted)
+
+#Create HAR lag
+har_df <- bond_futures %>%
+  mutate(
+    RV_D = lag(RV, 1),
+    RV_W = rollmean(lag(RV, 1), k = 5, fill = NA, align = "right"),
+    RV_M = rollmean(lag(RV, 1), k = 22, fill = NA, align = "right")
+  ) %>%
+  drop_na()
+
+#Fit HAR model
+har_model <- lm(RV ~ RV_D + RV_W + RV_M, data = har_df)
+
+#Summary of model
+summary(har_model)
+
+#Add Prediction, since we are predicting, one month of data is being used to forecast at very start, so the dataframe start around Feb
+har_df <- har_df %>%
+  mutate(RV_hat = predict(har_model))
+
+ggplot(har_df, aes(x = date)) +
+  geom_line(aes(y = RV), color = "black", alpha = 0.6) +
+  geom_line(aes(y = RV_hat), color = "blue") +
+  labs(
+    title = "HAR Model: Actual vs Predicted Realized Variance",
+    y = "Squared Log Return (RV)", x = "Date"
+  )
+```
+
+
+Error in `$<-`:
+! Assigned data `predict(har_model)` must be compatible with existing data.
+✖ Existing data has 5124 rows.
+✖ Assigned data has 5073 rows.
+ℹ Only vectors of size 1 are recycled.
+Caused by error in `vectbl_recycle_rhs_rows()`:
+! Can't recycle input of size 5073 to size 5124.
+Run `rlang::last_trace()` to see where the error occurred.
+Error in `$<-`(`*tmp*`, RV_hat, value = c(`1` = 3.16596415191453e-05,  : 
+  
+✖ Existing data has 5124 rows.
+✖ Assigned data has 5073 rows.
+ℹ Only vectors of size 1 are recycled.
+Caused by error in `vectbl_recycle_rhs_rows()`:
+! Can't recycle input of size 5073 to size 5124.
