@@ -1,0 +1,58 @@
+---
+title: "Untitled"
+author: "Shawn Xiao"
+date: "2025-04-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(zoo)
+library(dplyr)
+library(visdat)
+library(tidyr)
+library(quantmod)
+library(tidyquant)
+library(ggplot2)
+library(purrr)
+```
+
+
+```{r pressure, echo=FALSE}
+# No 20 years
+bond_futures_df <- data.frame(
+  Symbol = c("ZT=F", "Z3N=F", "ZF=F", "ZN=F", "ZB=F"),
+  Duration = c("2-Year", "3-Year", "5-Year", "10-Year", "30-Year"),
+  row.names = NULL
+)
+
+# Step 2: Function to download and process each bond future
+get_bond_data <- function(symbol, duration_label) {
+  tq_get(symbol, from = "2023-01-01", to = "2025-01-01") %>%
+    mutate(
+      Duration = duration_label,
+      log_return = log(adjusted / lag(adjusted)),
+      Bond_Index = symbol
+    ) %>%
+    select(date, Duration, adjusted, log_return, Bond_Index)
+}
+
+all_bonds <- map2_df(bond_futures_df$Symbol, bond_futures_df$Duration, get_bond_data)
+
+head(all_bonds)
+
+vis_miss(all_bonds)
+missing_values <- is.na(all_bonds) 
+
+#Missing Data due to US.Market Non-trading Day, best to carry on the previous day data
+#Since using log return, when there is no previous day data, there will be missing value
+
+# Save the dataset as a CSV file in your working directory
+write.csv(all_bonds, "bond_futures_data.csv", row.names = FALSE)
+
+```
+
+
+```{r}
+
+```
