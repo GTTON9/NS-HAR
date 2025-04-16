@@ -15,6 +15,7 @@ library(quantmod)
 library(tidyquant)
 library(ggplot2)
 library(purrr)
+library(ggplot2)
 ```
 
 
@@ -26,7 +27,7 @@ bond_futures_df <- data.frame(
   row.names = NULL
 )
 
-# Step 2: Function to download and process each bond future
+#Function to download and process each bond future
 get_bond_data <- function(symbol, duration_label) {
   tq_get(symbol, from = "2023-01-01", to = "2025-01-01") %>%
     mutate(
@@ -54,5 +55,111 @@ write.csv(all_bonds, "bond_futures_data.csv", row.names = FALSE)
 
 
 ```{r}
+bond_data <- read.csv("bond_futures_data.csv")
+
+#Calculate squared return as realized volatility proxy
+#Redo this part in Gareth's version as the multiplication of past two day's log_return
+bond_data <- bond_data %>%
+  mutate(RV = log_return^2)
+
+bond_data <- read.csv("bond_futures_data.csv") %>%
+  arrange(Bond_Index, date) %>%
+  group_by(Bond_Index) %>%
+  mutate(abs_ret = abs(log_return),
+         RV = abs_ret * lag(abs_ret)) %>%
+  ungroup()
+
+#Not 100% sure if I am doing this the same way as the broad
+create_har_features <- function(df) {
+  df %>%
+    arrange(date) %>%
+    mutate(
+      RV_D = lag(RV, 1),
+      RV_W = rollmean(lag(RV, 1), 5, fill = NA, align = "right"),
+      RV_M = rollmean(lag(RV, 1), 22, fill = NA, align = "right")
+    ) %>%
+    drop_na()}
+
+har_data <- bond_data %>%
+  group_by(Bond_Index) %>%
+  group_modify(~ create_har_features(.x)) %>%
+  ungroup()
+
+fit_har_model <- function(df) {
+  model <- lm(RV ~ RV_D + RV_W + RV_M, data = df)
+  df$RV_hat <- predict(model)
+  df$residuals <- residuals(model)
+  return(df)
+}
+
+#Using 1month data to start the modeling
+har_results <- har_data %>%
+  group_by(Bond_Index) %>%
+  group_modify(~ fit_har_model(.x)) %>%
+  ungroup()
+
+har_results <- har_results %>%
+  mutate(eta = residuals / sqrt(RV_hat))
+
+eta_wide <- har_results %>%
+  select(date, Bond_Index, eta) %>%
+  pivot_wider(names_from = Bond_Index, values_from = eta) %>%
+  drop_na()
+
+#Shoud be run the corrlation martix of the return or the model residuals 
+R <- cor(eta_wide %>% select(-date), use = "pairwise.complete.obs")
+bond_names <- colnames(R)
+num_bonds <- length(bond_names)
+
+# Simulate ε_t ~ N(0, R) for one time period (or n steps)
+# Maybe Use Confidence Interval Instead
+set.seed(42)
+n_sim <- nrow(eta_wide)  # simulate same number of days
+E_sim <- MASS::mvrnorm(n = n_sim, mu = rep(0, num_bonds), Sigma = R)
+
+# Use most recent HAR estimates
+rv_wide <- har_results %>%
+  select(date, Bond_Index, RV_hat) %>%
+  pivot_wider(names_from = Bond_Index, values_from = RV_hat) %>%
+  filter(date %in% eta_wide$date) %>%
+  select(-date)
+
+# Ensure dimension match
+stopifnot(nrow(rv_wide) == n_sim)
+
+# Compute E_tilted = diag(sqrt(h_t)) %*% E_t
+E_tilted_matrix <- matrix(NA, nrow = n_sim, ncol = num_bonds)
+for (i in 1:n_sim) {
+  D_sqrt <- diag(sqrt(unlist(rv_wide[i, ])))
+  E_tilted_matrix[i, ] <- D_sqrt %*% E_sim[i, ]
+}
+
+# Output: E_tilted_matrix is now your simulated CCC-HAR scaled shock matrix
+colnames(E_tilted_matrix) <- bond_names
+E_tilted_df <- cbind(date = eta_wide$date, as.data.frame(E_tilted_matrix))
+
+# Preview result
+print(head(E_tilted_df))
+```
+```{r}
+# Compute confidence intervals using RV_hat (HAR-fitted variance)
+ci_df <- har_results %>%
+  filter(RV_hat > 0) %>%
+  mutate(
+    lower_CI = -1.96 * sqrt(RV_hat),
+    upper_CI =  1.96 * sqrt(RV_hat)
+  ) %>%
+  select(date, Bond_Index, log_return, RV_hat, lower_CI, upper_CI)
+
+ci_df %>%
+  filter(Bond_Index == "ZB=F") %>%
+  ggplot(aes(x = as.Date(date))) +
+  geom_line(aes(y = log_return), color = "black", size = 0.7) +
+  geom_ribbon(aes(ymin = lower_CI, ymax = upper_CI), fill = "blue", alpha = 0.2) +
+  labs(
+    title = "95% Confidence Interval for Log Return (ZB=F)",
+    y = "Log Return", x = "Date"
+  )
 
 ```
+
