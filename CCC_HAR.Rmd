@@ -98,23 +98,22 @@ har_results <- har_data %>%
   group_modify(~ fit_har_model(.x)) %>%
   ungroup()
 
-har_results <- har_results %>%
-  mutate(eta = residuals / sqrt(RV_hat))
-
-eta_wide <- har_results %>%
-  select(date, Bond_Index, eta) %>%
-  pivot_wider(names_from = Bond_Index, values_from = eta) %>%
+RV_Hat <- har_results %>%
+  select(date, Bond_Index, RV_hat) %>%
+  pivot_wider(names_from = Bond_Index, values_from = RV_hat) %>%
   drop_na()
 
 #Shoud be run the corrlation martix of the return or the model residuals 
-R <- cor(eta_wide %>% select(-date), use = "pairwise.complete.obs")
+R <- cor(RV_Hat %>% select(-date), use = "pairwise.complete.obs")
+
+
 bond_names <- colnames(R)
 num_bonds <- length(bond_names)
 
 # Simulate ε_t ~ N(0, R) for one time period (or n steps)
 # Maybe Use Confidence Interval Instead
 set.seed(42)
-n_sim <- nrow(eta_wide)  # simulate same number of days
+n_sim <- nrow(RV_Hat)  # simulate same number of days
 E_sim <- MASS::mvrnorm(n = n_sim, mu = rep(0, num_bonds), Sigma = R)
 
 # Use most recent HAR estimates
