@@ -1,0 +1,1020 @@
+---
+title: "Functions"
+output: html_document
+date: "2025-05-26"
+---
+
+```{r setup, include=FALSE}
+library(MASS)
+library(ggplot2)
+library(tibble)
+library(rugarch)
+library(xts)
+library(dplyr)
+library(lubridate)
+library(MASS)
+```
+
+# Functions
+
+
+```{r}
+interp_yc <- function(ttms, yieldMat,newTen, degree = 3){
+  
+  # yield_list: parameter of the form of a list of data frames containing ZCB spot rate
+  # int knots: the interior knots used for b-spline construction
+  # degree: highest degree of polynomials for the basis functions
+  # d: the date chosen to interpolate from the list
+  # last_tenor: last tenor to interpolate in a day
+  
+  # Initialize Funcs
+  
+  basis <- function(x, degree, i, knots){
+    if(degree == 0){
+      B <- ifelse((x>=knots[i])&(x<knots[i+1]),1,0)
+    } else {
+      if((knots[degree + i] - knots[i]) == 0){
+        if(x != knots[i+degree]){
+          alpha1 <- 0
+        } else {
+          return(1)
+        }
+      } else {
+        alpha1 <- (x-knots[i])/(knots[degree+i] - knots[i])
+      }
+      if((knots[i+degree+1] - knots[i+1]) == 0){
+        if(x != knots[i+degree]){
+          alpha2 <- 0
+        } else {
+          return(1)
+        }
+      } else {
+        alpha2 <- (knots[i+degree+1] - x) / (knots[i+degree+1] - knots[i+1])
+      }
+      B <- alpha1 * basis(x, (degree-1), i, knots) + 
+        alpha2*basis(x, (degree-1), (i+1), knots)
+    }
+    return(B)
+  }
+  
+  # chug them into a matrix
+  matrix_b <- function(x, degree=3, int_knots) { 
+    # the x argument takes in a vector of time values that 
+    # will be used to evaluate a design matrix of basis functions 
+    # the degree argument specifies the highest degree of polynomials for
+    # the basis functions
+    # the int_knots argument takes in a vector of knots that will be used 
+    # to determine the intervals of the piecewise function
+    bound_knots <- int_knots[c(1, length(int_knots))] # this line creates bound knots
+    knots <- c(rep(bound_knots[1], (degree+1)), int_knots[c(-1, -length(int_knots))], rep(bound_knots[2], (degree+1)))
+    # the line above adds a couple of extra knots to each end of the int_knots vector because of the Cox-deBoor recursion
+    K <- length(int_knots) + degree - 1 # number of columns in the Basis matrix
+    B.mat <- matrix(0,nrow = length(x), ncol = K) # initialize the matrix
+    for(j in 1:K) {
+      B.mat[,j] <- sapply(X = x, FUN = basis, degree = degree, i = j, knots = knots) # add each column, one by one
+    }
+    return(B.mat) # return the matrix
+  }
+
+  int_knots <- ttms
+  N <- length(ttms)
+  if(N %in% c(5, 6)){
+    int_knots <- c(0, quantile(ttms, probs = c(0, 0.5, 1)))
+  } else if(N %in% c(7,8,9)){
+    int_knots <- c(0,quantile(ttms, probs = c(0, 0.33, 0.66, 1)))
+  } else if(N %in% 10:15){
+    int_knots <- c(0,quantile(ttms, probs = c(0, 0.25, 0.5, .75, 1)))
+  } else {
+    int_knots <- c(0,quantile(ttms, probs = c(0, 0.20, 0.4, .6, .8, 1)))
+  }
+  
+  
+  yields <- cbind(rep(0, nrow(yieldMat)),as.matrix(yieldMat))
+  
+  
+  x <- as.numeric(c(0,ttms)) # maturity dates
+  B <- matrix_b(x, degree=degree, int_knots = ,int_knots)
+  B_t_B <- t(B) %*% B
+  
+  # B is the design matrix on which the least squares coefficients will be calculated
+  
+  alphas <- solve(B_t_B) %*% t(B) %*% t(yields) # OLS Formula for coefficients
+  x2 <- newTen # this range is used to simulate a continuous yield curve
+  B2 <- matrix_b(x2, degree = degree, int_knots = int_knots) 
+  # B2 is the matrix of basis functions but evaluated at a 'continuous' time (not really but close enough)
+  
+  interpolated_yields <- t(B2 %*% alphas) # create dataframes for plotting
+  colnames(interpolated_yields) <- newTen
+  return(interpolated_yields)
+}
+
+# interp_yc(tenors_raw, treasury_yields,tenors_bt, degree = 3)
+
+```
+
+Interpolate a list of data with different dates.
+
+
+
+
+Standard Kalman Filter
+```{r}
+KF_NS <- function(par, yields, tenors, lambda) {
+  # Standard Kalman Filter for Nelson Siegel model
+  # Model:
+  #   y_t = d_t + F_t' x_t + f_t + v_t, v_t ~ N(0, V), observation equation
+  #   x_t = c + G x_{t-1} + w_t, w_t ~ N(0, W), state equation
+  #   f_t = b*t + beta*cos(2*pi*t*dt) + eta*sin(2*pi*t*dt), seasonal effect
+  # Inputs:
+  #   par: a vector of parameters
+  #   yt: the logarihm of futures prices
+  #   T: maturities
+  #   delivery_time: a vector of date, which is necessary if seasonality is "Constant"
+  #   dt: delta t
+  #   smoothing: a boolean variable indicate if Kalman Smoothing is required
+  #   seasonality: "Constant" or "None"
+  # Outputs:
+  #   nll: the negative log likelihood
+  #   ll_table: a vector to store cumulative log-likelihood at each time point - used to calculate Sandwich variance
+  #   table_at_filter: a nT*2 matrix gives the filtered values of state variables.
+  #   table_at_prediction: a (nT+1)*2 matrix gives the predicted values of state variables.
+  #   table_at_smoother: a nT*2 matrix gives the smoothed values of state variables. The algorithm of Kalman Smoother is given by Bierman (1973) and De Jong (1989).
+  #   ft: seasonal effect
+
+ # require(lubridate)
+
+  T_ <- dim(yields)[1] # n_obs
+  N <- dim(yields)[2]
+
+  table_xt_filter <- matrix(0, nrow = T_, ncol = 3) # a_t|t
+  table_Pt_filter <- array(0, dim = c(3, 3, T_)) # P_t|t
+  table_xt_prediction <- matrix(0, nrow = T_+1, ncol = 3) # a_t|t-1
+  table_Pt_prediction <- array(0, dim = c(3, 3, T_+1)) # P_t|t-1
+  
+  nll <- 0 # negative log-likelihood
+  ll_table <- matrix(0, nrow = 1, ncol = T_) # table of log-likelihood
+
+  table_et <- matrix(0, nrow = T_, ncol = N) # e_t
+  table_L <- array(0, dim = c(N, N, T_)) # Covariance of y
+  table_y <- matrix(0, nrow = T_, ncol = N) # y_hat
+
+  # Parameters
+  if (length(par) != 9+N) {
+    stop("Incorrect number of parameters. ")
+  }
+
+  A_0 <- c(par[1], par[2], par[3])
+  A_1 <- diag(c(par[4], par[5], par[6]))
+  x0 <- A_0 / (1 - diag(A_1))
+
+  sigma_w <- diag( par[7:9] )
+  sigma_v <- diag( par[10: length(par)] )
+  
+  # Initialization
+  xt_filter <- x0
+  Pt_filter <- diag( diag(sigma_w) / (1 - diag(A_1)^2) )
+
+  # Kalman Filter
+  for (i in 1:T_) {
+    Phi <- rbind(rep(1, N),
+                    (1 - exp(-lambda * tenors)) / (lambda * tenors),
+                    (1 - exp(-lambda * tenors)) / (lambda * tenors) - exp(-lambda * tenors))
+
+    # Prediction step
+    xt_prediction  <- A_0 + A_1 %*% xt_filter # a_t+1|t
+    Pt_prediction <- A_1 %*% Pt_filter %*% t(A_1) + sigma_w # P_t+1|t
+    y_prediction <- t(Phi) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+
+    # Filter step
+    et <- yields[i, ] - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+    L <- t(Phi) %*% Pt_prediction %*% Phi + sigma_v # Covariance matrix of et
+    invL <- solve(L) # inverse of L
+    K <- Pt_prediction %*% Phi %*% invL # Kalman gain matrix: K_t
+
+    xt_filter <- xt_prediction + K %*% t(et) # a_t
+    Pt_filter <- (diag(3) - K %*% t(Phi)) %*% Pt_prediction # P_t
+    #Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction %*% t(diag(3) - K %*% t(lambda)) + K %*% sigma_v %*% t(K)
+
+    # Update tables
+    table_xt_filter[i, ] <- t(xt_filter)
+    table_Pt_filter[, , i] <- Pt_filter
+    table_xt_prediction[i+1, ] <- t(xt_prediction)
+    table_Pt_prediction[, , i+1] <- Pt_prediction
+    table_et[i, ] <- et
+    table_L[, , i] <- L
+    table_y[i, ] <- y_prediction
+
+    if (det(L)<0) {
+      message(i)
+      message("matrix is not semi positive definite (KF)")
+    }
+
+    # Update likelihood
+    nll <- nll + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+    ll_table[i] <- -(0.5*length(yields[i, ])*log(2*pi) + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et))
+  }
+
+  return(list(nll = nll,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+
+```
+
+```{r}
+yule_walker_ar1 <- function(ts) {
+  # Estimates the parameters of an AR(1) process using the Yule-Walker equations.
+  #
+  # Parameters:
+  # ts: A univariate time series (numeric vector).
+  #
+  # Returns:
+  # A list containing:
+  #   phi: The estimated autoregressive coefficient.
+  #   sigma2: The estimated variance of the innovations.
+  #   c: The estimated intercept term.
+
+  # Compute the sample mean (used for centering the time series)
+  mu <- mean(ts)
+  
+  # Center the time series
+  ts_centered <- ts - mu
+  
+  # Compute the autocovariance at lag 0 and lag 1
+  gamma0 <- var(ts_centered) * (length(ts_centered) - 1) / length(ts_centered)
+  gamma1 <- sum(ts_centered[-1] * ts_centered[-length(ts_centered)]) / length(ts_centered)
+  
+  # Estimate phi using the Yule-Walker equation
+  phi <- gamma1 / gamma0
+  
+  # Estimate the intercept c
+  c <- mu * (1 - phi)
+  
+  # Estimate the innovation variance sigma2
+  sigma2 <- gamma0 * (1 - phi^2)
+  
+  # Return the estimates
+  return(list(phi = phi, sigma2 = sigma2, c = c))
+}
+
+```
+
+OLS for Nelson Siegel
+
+```{r}
+fit_dynamic_NS <- function(yields, lambda, tenors){
+  N <- length(tenors)
+  T_ <- nrow(yields)
+  
+  term1 <- 1
+  term2 <- (1 - exp(-tenors*lambda)) / (tenors*lambda)
+  term3 <- ((1 - exp(-tenors*lambda)) / (tenors*lambda)) - exp(-tenors*lambda)
+  Phi <- cbind(term1, term2, term3)
+  
+  
+  betas <- matrix(NA, nrow =T_, ncol = 3)
+  eps <- matrix(NA, nrow = T_, ncol = N)
+  for(i in 1:T_){
+    m <- solve(t(Phi) %*% Phi, t(Phi))
+    betas[i,] <- (solve(t(Phi) %*% Phi, t(Phi))) %*% as.matrix(yields[i,])
+    eps[i,] <- yields[i,] - Phi %*% betas[i,]
+    
+  }
+  sig_hat2 <- sum(eps^2) / (T_ * (N - 3))
+  cov_mat <- t(eps) %*% eps / (T_ - 3)
+  
+  return(list(betas = betas, # fitted betas static: 1*3   dynamic: T*3
+              sigma2 = sig_hat2, # MSE
+              lambda = lambda, # lambda(input)
+              cov_mat = cov_mat, 
+              eps = eps,
+              Phi = Phi))
+}
+
+
+```
+
+```{r}
+get_lambda <- function(yields, lambda_grid, tenors){
+  results <- lapply(lambda_grid, function(lam) {
+  fit_dynamic_NS(yields, lambda = lam, tenors = tenors)$sigma2
+    })
+  return(lambda_grid[which.min(results)])
+}
+
+```
+
+```{r}
+KF_param_est <- function(yields, lambda, tenors){
+  tsBetas <- matrix(NA, ncol = nrow(yields), nrow = 3) # OLS fit for the 
+  obs_res <- matrix(NA, ncol = nrow(yields), nrow = 1)
+  times <- as.character(as.POSIXct(yields[,0]))
+  
+  ols_fit <- fit_dynamic_NS(yields, lambda = lambda, tenors)
+  ols_betas <- as.matrix(ols_fit$betas)
+  ols_res <- as.matrix(ols_fit$eps)
+  
+  rownames(ols_betas) <- times
+  colnames(ols_betas) <- NS_name
+  rownames(ols_res) <- times
+  colnames(ols_res) <- tenors
+  
+  AR1_level <- yule_walker_ar1(ols_betas[,1])
+  AR1_slope <- yule_walker_ar1(ols_betas[,2])
+  AR1_curv <- yule_walker_ar1(ols_betas[,3])
+  
+  mats_matrix_real <- matrix(rep(tenors, each = nrow(yields)), nrow = nrow(bt_treasury_yields), byrow = FALSE)
+  A <- diag(c(AR1_level$c, AR1_slope$c, AR1_curv$c))
+  icpt <-  matrix(c(AR1_level$phi, AR1_slope$phi, AR1_curv$phi), nrow = 3, ncol =1)
+  W <- diag(c(AR1_level$sigma2, AR1_slope$sigma2, AR1_curv$sigma2))
+  V <- diag(rep(bt_ols_fit$sigma2, length(tenors_bt)))
+  parameters <- c(AR1_level$c, AR1_slope$c, AR1_curv$c, AR1_level$phi, AR1_slope$phi, AR1_curv$phi, AR1_level$sigma2, AR1_slope$sigma2, AR1_curv$sigma2, rep(bt_ols_fit$sigma2, length(tenors_bt)))
+
+  return(list(trans_mat = A, 
+              trans_icpt = icpt,
+              obs_cov_mat = W,
+              latent_cov_mat = (rep(bt_ols_fit$sigma2, length(tenors_bt))),
+              parameters = parameters))
+
+}
+```
+
+
+```{r}
+get_RV <- function(log_returns, latent_log_returns, tenors, times){
+  
+  # latent_RV_day <- as.data.frame(latent_log_returns) %>%
+  # mutate(day = as.Date(rownames(latent_log_returns))) %>%
+  # group_by(day) %>%
+  # summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+  
+  
+  latent_RV_week <- as.data.frame(latent_log_returns) %>%
+  mutate(week = floor_date(as.Date(rownames(latent_log_returns)), "week")) %>%
+  group_by(week) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+
+  
+  latent_RV_month <- as.data.frame(latent_log_returns) %>%
+  mutate(month = floor_date(as.Date(rownames(latent_log_returns)), "month")) %>%
+  group_by(month) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+  
+  latent_RV_quarter <- as.data.frame(latent_log_returns) %>%
+  mutate(quarter = floor_date(as.Date(rownames(latent_log_returns)), "quarter")) %>%
+  group_by(quarter) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+
+  RV_y <- as.data.frame(log_returns) %>% mutate(across(where(is.numeric), ~ .^2))
+  
+  new_names <- c("RV_y","RV_level_week", "RV_slope_week", "RV_curvature_week" 
+  ,"RV_level_month", "RV_slope_month", "RV_curvature_month"
+  ,"RV_level_quarter", "RV_slope_quarter", "RV_curvature_quarter" )
+
+  latent_RV_all <- as.data.frame(latent_log_returns) %>%
+  mutate(
+    week  = floor_date(as.Date(rownames(.)), "week"),
+    month = floor_date(as.Date(rownames(.)), "month"),
+    quarter = floor_date(as.Date(rownames(.)), "quarter")
+  ) %>%
+  left_join(latent_RV_week,  by = "week") %>%
+  left_join(latent_RV_month, by = "month") %>%
+  left_join(latent_RV_quarter, by = "quarter") %>%
+  dplyr::select(7:15) # messed up by MASS package  
+  
+  RV_array <- array(NA, dim = c(nrow(RV_y), length(new_names), length(tenors)))
+
+  for (i in seq_along(tenors)) {
+    RV_matrix <- cbind(RV_y[, i], latent_RV_all) %>%
+    rename_with(~ new_names, .cols = everything()) %>%
+    as.matrix()
+  
+    RV_array[, , i] <- RV_matrix
+  
+  }
+  return(RV_array)
+}
+```
+
+
+
+get_likelihood
+```{r}
+get_log_likelihood <-function(A_0, A_1, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter){
+    
+    
+  xt_prediction  <- A_0 + A_1 %*% xt_filter # a_t+1|t
+  Pt_prediction <- A_1 %*% Pt_filter %*% t(A_1) + sigma_w # P_t+1|t
+  y_prediction <- t(Phi) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+
+  # Filter step
+  et <- y_t - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+  L <- t(Phi) %*% Pt_prediction %*% Phi + sigma_v # Covariance matrix of et
+    
+  log_likelihood_t <- 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+  return(log_likelihood_t)
+}
+
+partial_A_0_approx <- function(A_0, A_1, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter, h = 0.01, index){
+    i <- index + 1
+    grad_A <- rep(0, 3)
+    A_plus <- A_0
+    A_minus <- A_0
+    
+    delta <- ifelse(A_0[i] == 0, h, A_0[i] * h)
+    A_plus[i] <- A_0[i] + delta
+    A_minus[i] <- A_0[i] - delta
+    
+    log_likelihood_plus <- get_log_likelihood(A_plus, A_1, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter)
+    log_likelihood_minus <- get_log_likelihood(A_minus, A_1, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter)
+  
+    grad <- (log_likelihood_plus - log_likelihood_minus) / (2 * delta)
+    grad_A[i] <- ifelse(is.na(grad), 0, grad)
+    
+    return(grad_A)
+    
+}
+    
+partial_A_1_approx <- function(A_0, A_1, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter, h = 0.01, index){
+  
+    i <- j <- index - 2
+    grad_A <- matrix(0, nrow = nrow(A_1), ncol = ncol(A_1))
+    A_plus <- A_1
+    A_minus <- A_1
+    
+    delta <- A_1[i, j] * h
+    A_plus[i, j] <- A_1[i, j] + delta
+    A_minus[i, j] <- A_1[i, j] - delta
+   
+    log_likelihood_plus <- get_log_likelihood(A_0, A_plus, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter)
+    log_likelihood_minus <- get_log_likelihood(A_0, A_minus, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter)
+    
+    grad <- (log_likelihood_plus - log_likelihood_minus) / (2 * delta)
+    grad_A[i, j] <- ifelse(is.na(grad), 0, grad)
+
+    return( grad_A)
+  
+}
+    
+```
+
+
+
+```{r}
+KF_NS_GD_diag <- function(yields, tenors, lambda, sigma_w_vec, sigma_v_vec, x_init){
+  # Standard Kalman Filter for Nelson Siegel model
+  # Model:
+  #   y_t = d_t + F_t' x_t + f_t + v_t, v_t ~ N(0, V), observation equation
+  #   x_t = c + G x_{t-1} + w_t, w_t ~ N(0, W), state equation
+  #   f_t = b*t + beta*cos(2*pi*t*dt) + eta*sin(2*pi*t*dt), seasonal effect
+  # Inputs:
+  #   par: a vector of parameters
+  #   yt: the logarihm of futures prices
+  #   T: maturities
+  #   delivery_time: a vector of date, which is necessary if seasonality is "Constant"
+  #   dt: delta t
+  #   smoothing: a boolean variable indicate if Kalman Smoothing is required
+  #   seasonality: "Constant" or "None"
+  # Outputs:
+  #   nll: the negative log likelihood
+  #   ll_table: a vector to store cumulative log-likelihood at each time point - used to calculate Sandwich variance
+  #   table_at_filter: a nT*2 matrix gives the filtered values of state variables.
+  #   table_at_prediction: a (nT+1)*2 matrix gives the predicted values of state variables.
+  #   table_at_smoother: a nT*2 matrix gives the smoothed values of state variables. The algorithm of Kalman Smoother is given by Bierman (1973) and De Jong (1989).
+  #   ft: seasonal effect
+
+ # require(lubridate)
+
+  T_ <- dim(yields)[1] # n_obs
+  N <- dim(yields)[2]
+
+  table_xt_filter <- matrix(0, nrow = T_, ncol = 3) # a_t|t
+  table_Pt_filter <- array(0, dim = c(3, 3, T_)) # P_t|t
+  table_xt_prediction <- matrix(0, nrow = T_+1, ncol = 3) # a_t|t-1
+  table_Pt_prediction <- array(0, dim = c(3, 3, T_+1)) # P_t|t-1
+  
+  
+  ll_table <- matrix(0, nrow = 1, ncol = T_) # table of log-likelihood
+
+  table_et <- matrix(0, nrow = T_, ncol = N) # e_t
+  table_L <- array(0, dim = c(N, N, T_)) # Covariance of y
+  table_y <- matrix(0, nrow = T_, ncol = N) # y_hat
+
+ 
+
+  A_0 <- c(0,0,0)
+  A_1 <- diag(c(1,1,1))
+  
+  sigma_w <- diag(sigma_w_vec)
+  sigma_v <- diag(sigma_v_vec)
+  
+  # Initialization
+  
+  
+  for(k in 1:10000){
+    
+    dA_0 <- matrix(0, nrow = 3, ncol = 1)
+    dA_1 <- matrix(0, nrow = 3, ncol = 3)
+    
+    x0 <- x_init
+    Pt_filter <- diag(rep(0.005100334,3))
+    #x0 <- A_0 / (1 - diag(A_1))
+    xt_filter <- x0
+    #Pt_filter <- diag( diag(sigma_w) / (1 - diag(A_1)^2) )
+    nll <- 0 # negative log-likelihood
+    for (i in 1:T_) {
+      Phi <- rbind(rep(1, N),
+                      (1 - exp(-lambda * tenors)) / (lambda * tenors),
+                      (1 - exp(-lambda * tenors)) / (lambda * tenors) - exp(-lambda * tenors))
+  
+      # Prediction step
+      xt_prediction  <- A_0 + A_1 %*% xt_filter # a_t+1|t
+      Pt_prediction <- A_1 %*% Pt_filter %*% t(A_1) + sigma_w # P_t+1|t
+      y_prediction <- t(Phi) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+  
+      # Filter step
+      et <- yields[i, ] - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+      L <- t(Phi) %*% Pt_prediction %*% Phi + sigma_v # Covariance matrix of et
+      invL <- solve(L) # inverse of L
+      K <- Pt_prediction %*% Phi %*% invL # Kalman gain matrix: K_t
+      
+      if( k%%6 < 3 ){
+        dA_0 <- dA_0 + partial_A_0_approx(A_0, A_1, Phi, sigma_w, sigma_v, yields[i,], xt_filter, Pt_filter, index = (k%%6))
+      }else{
+        dA_1 <- dA_1 + partial_A_1_approx(A_0, A_1, Phi, sigma_w, sigma_v, yields[i,], xt_filter, Pt_filter, index = (k%%6))
+        
+      }
+      
+      xt_filter <- xt_prediction + K %*% t(et) # a_t
+      Pt_filter <- (diag(3) - K %*% t(Phi)) %*% Pt_prediction # P_t
+      #Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction %*% t(diag(3) - K %*% t(lambda)) + K %*% sigma_v %*% t(K)
+      
+     
+      
+      # Update tables
+      table_xt_filter[i, ] <- t(xt_filter)
+      table_Pt_filter[, , i] <- Pt_filter
+      table_xt_prediction[i+1, ] <- t(xt_prediction)
+      table_Pt_prediction[, , i+1] <- Pt_prediction
+      table_et[i, ] <- et
+      table_L[, , i] <- L
+      table_y[i, ] <- y_prediction
+  
+      if (det(L)<0) {
+        message(i)
+        message("matrix is not semi positive definite (KF)")
+
+      }
+  
+      # Update likelihood
+      nll <- nll + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+      ll_table[i] <- -(0.5*length(yields[i, ])*log(2*pi) + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et))
+      
+    }
+    
+    
+    last_A_0 <- A_0
+    last_A_1 <- A_1
+    A_0 <- A_0 - 0.000001 * dA_0
+    A_1 <- A_1 - 0.000001 * dA_1
+    
+    print(A_0)
+    print(A_1)
+    print(nll)
+    
+    if ((norm((A_0 - last_A_0), type = "2") < 1e-6) && (norm((A_1 - last_A_1), type = "2") < 1e-6)) {
+      print("converge")
+        break
+    }
+  }
+  # return(list(A_0 = A_0,
+  #             A_1 = A_1))
+  
+  return(list(nll = nll,A_0 = A_0, A_1 = A_1,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+```
+
+
+```{r}
+KF_NS_GD<- function(yields, tenors, lambda, sigma_w_vec, sigma_v_vec, x_init){
+  # Standard Kalman Filter for Nelson Siegel model
+  # Model:
+  #   y_t = d_t + F_t' x_t + f_t + v_t, v_t ~ N(0, V), observation equation
+  #   x_t = c + G x_{t-1} + w_t, w_t ~ N(0, W), state equation
+  #   f_t = b*t + beta*cos(2*pi*t*dt) + eta*sin(2*pi*t*dt), seasonal effect
+  # Inputs:
+  #   par: a vector of parameters
+  #   yt: the logarihm of futures prices
+  #   T: maturities
+  #   delivery_time: a vector of date, which is necessary if seasonality is "Constant"
+  #   dt: delta t
+  #   smoothing: a boolean variable indicate if Kalman Smoothing is required
+  #   seasonality: "Constant" or "None"
+  # Outputs:
+  #   nll: the negative log likelihood
+  #   ll_table: a vector to store cumulative log-likelihood at each time point - used to calculate Sandwich variance
+  #   table_at_filter: a nT*2 matrix gives the filtered values of state variables.
+  #   table_at_prediction: a (nT+1)*2 matrix gives the predicted values of state variables.
+  #   table_at_smoother: a nT*2 matrix gives the smoothed values of state variables. The algorithm of Kalman Smoother is given by Bierman (1973) and De Jong (1989).
+  #   ft: seasonal effect
+
+ # require(lubridate)
+
+  T_ <- dim(yields)[1] # n_obs
+  N <- dim(yields)[2]
+
+  table_xt_filter <- matrix(0, nrow = T_, ncol = 3) # a_t|t
+  table_Pt_filter <- array(0, dim = c(3, 3, T_)) # P_t|t
+  table_xt_prediction <- matrix(0, nrow = T_+1, ncol = 3) # a_t|t-1
+  table_Pt_prediction <- array(0, dim = c(3, 3, T_+1)) # P_t|t-1
+  
+  
+  ll_table <- matrix(0, nrow = 1, ncol = T_) # table of log-likelihood
+
+  table_et <- matrix(0, nrow = T_, ncol = N) # e_t
+  table_L <- array(0, dim = c(N, N, T_)) # Covariance of y
+  table_y <- matrix(0, nrow = T_, ncol = N) # y_hat
+
+ 
+
+  A_0 <- c(0,0,0)
+  A_1 <- diag(c(1,1,1))
+  
+  sigma_w <- diag(sigma_w_vec)
+  sigma_v <- diag(sigma_v_vec)
+  
+  # Initialization
+  last_A_0 <- A_0
+  last_A_1 <- A_1
+      
+  
+  for(k in 1:10000){
+    
+    dA_0 <- matrix(0, nrow = 3, ncol = 1)
+    dA_1 <- matrix(0, nrow = 3, ncol = 3)
+    
+    x0 <- x_init
+    Pt_filter <- diag(rep(0.005100334,3))
+    #x0 <- A_0 / (1 - diag(A_1))
+    xt_filter <- x0
+    #Pt_filter <- diag( diag(sigma_w) / (1 - diag(A_1)^2) )
+    nll <- 0 # negative log-likelihood
+    
+    for (i in 1:T_) {
+      Phi <- rbind(rep(1, N),
+                      (1 - exp(-lambda * tenors)) / (lambda * tenors),
+                      (1 - exp(-lambda * tenors)) / (lambda * tenors) - exp(-lambda * tenors))
+  
+      # Prediction step
+      xt_prediction  <- A_0 + A_1 %*% xt_filter # a_t+1|t
+      Pt_prediction <- A_1 %*% Pt_filter %*% t(A_1) + sigma_w # P_t+1|t
+      y_prediction <- t(Phi) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+  
+      # Filter step
+      et <- yields[i, ] - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+      L <- t(Phi) %*% Pt_prediction %*% Phi + sigma_v # Covariance matrix of et
+      invL <- solve(L) # inverse of L
+      K <- Pt_prediction %*% Phi %*% invL # Kalman gain matrix: K_t
+      
+      if( k%%12 < 3 ){
+        dA_0 <- dA_0 + partial_A_0_approx(A_0, A_1, Phi, sigma_w, sigma_v, yields[i,], xt_filter, Pt_filter, index = (k%%12))
+      }else{
+        dA_1 <- dA_1 + partial_A_1_approx_full(A_0, A_1, Phi, sigma_w, sigma_v, yields[i,], xt_filter, Pt_filter, index = (k%%12))
+        
+      }
+      
+      xt_filter <- xt_prediction + K %*% t(et) # a_t
+      Pt_filter <- (diag(3) - K %*% t(Phi)) %*% Pt_prediction # P_t
+      #Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction %*% t(diag(3) - K %*% t(lambda)) + K %*% sigma_v %*% t(K)
+      
+     
+      
+      # Update tables
+      table_xt_filter[i, ] <- t(xt_filter)
+      table_Pt_filter[, , i] <- Pt_filter
+      table_xt_prediction[i+1, ] <- t(xt_prediction)
+      table_Pt_prediction[, , i+1] <- Pt_prediction
+      table_et[i, ] <- et
+      table_L[, , i] <- L
+      table_y[i, ] <- y_prediction
+  
+      if (det(L)<0) {
+        message(i)
+        message("matrix is not semi positive definite (KF)")
+
+      }
+  
+      # Update likelihood
+      nll <- nll + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+      ll_table[i] <- -(0.5*length(yields[i, ])*log(2*pi) + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et))
+      
+    }
+    
+    if(k %% 12 == 11){
+      
+      
+      if ((norm((A_0 - last_A_0), type = "2") < 1e-6) && (norm((A_1 - last_A_1), type = "2") < 1e-6)) {
+        print("converge")
+          break
+      }
+      
+      last_A_0 <- A_0
+      last_A_1 <- A_1
+    
+    }
+    
+    A_0 <- A_0 - 0.000001 * dA_0
+    A_1 <- A_1 - 0.000001 * dA_1
+    
+    print(A_0)
+    print(A_1)
+    print(nll)
+    
+    
+    
+  }
+  # return(list(A_0 = A_0,
+  #             A_1 = A_1))
+  
+  return(list(nll = nll,A_0 = A_0, A_1 = A_1,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+
+
+```
+
+```{r}
+partial_A_1_approx_full <- function(A_0, A_1, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter, h = 0.01, index){
+    flat_pos <- ((index - 1) %% 9) + 1  # cycles through 1 to 9
+    i <- ((flat_pos - 1) %/% 3) + 1   # 1 to 3
+    j <- ((flat_pos - 1) %% 3) + 1  
+    
+    grad_A <- matrix(0, nrow = nrow(A_1), ncol = ncol(A_1))
+    A_plus <- A_1
+    A_minus <- A_1
+    
+    delta <- ifelse(A_0[i] == 0, h, A_0[i] * h)
+    A_plus[i, j] <- A_1[i, j] + delta
+    A_minus[i, j] <- A_1[i, j] - delta
+   
+    log_likelihood_plus <- get_log_likelihood(A_0, A_plus, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter)
+    log_likelihood_minus <- get_log_likelihood(A_0, A_minus, Phi, sigma_w, sigma_v, y_t, xt_filter, Pt_filter)
+    
+    grad <- (log_likelihood_plus - log_likelihood_minus) / (2 * delta)
+    grad_A[i, j] <- ifelse(is.na(grad), 0, grad)
+
+    return( grad_A)
+  
+}
+```
+
+
+
+KF_NS_EM_diag
+```{r}
+KF_NS_EM <- function(yields, tenors, lambda, sigma_w_vec, sigma_v_vec, x_init) {
+  T_ <- dim(yields)[1]
+  N <- dim(yields)[2]
+
+  table_xt_filter <- matrix(0, nrow = T_, ncol = 3)
+  table_Pt_filter <- array(0, dim = c(3, 3, T_))
+  table_xt_prediction <- matrix(0, nrow = T_ + 1, ncol = 3)
+  table_Pt_prediction <- array(0, dim = c(3, 3, T_ + 1))
+  ll_table <- matrix(0, nrow = 1, ncol = T_)
+  table_et <- matrix(0, nrow = T_, ncol = N)
+  table_L <- array(0, dim = c(N, N, T_))
+  table_y <- matrix(0, nrow = T_, ncol = N)
+
+  A_0 <- matrix(c(0, 0, 0), ncol = 1)
+  A_1 <- diag(3)
+
+  sigma_w <- diag(sigma_w_vec)
+  sigma_v <- diag(sigma_v_vec)
+
+  last_A_0 <- A_0
+  last_A_1 <- A_1
+
+  for (k in 1:1000) {
+    x0 <- x_init
+    Pt_filter <- diag(rep(0.0051, 3))
+    xt_filter <- x0
+    nll <- 0
+
+    for (i in 1:T_) {
+      Phi <- rbind(rep(1, N),
+                   (1 - exp(-lambda * tenors)) / (lambda * tenors),
+                   (1 - exp(-lambda * tenors)) / (lambda * tenors) - exp(-lambda * tenors))
+
+      xt_prediction <- A_0 + A_1 %*% xt_filter
+      Pt_prediction <- A_1 %*% Pt_filter %*% t(A_1) + sigma_w
+      y_prediction <- t(Phi) %*% xt_prediction
+
+      et <- yields[i, ] - t(y_prediction)
+      L <- t(Phi) %*% Pt_prediction %*% Phi + sigma_v
+      invL <- solve(L)
+      K <- Pt_prediction %*% Phi %*% invL
+
+      xt_filter <- xt_prediction + K %*% t(et)
+      Pt_filter <- (diag(3) - K %*% t(Phi)) %*% Pt_prediction
+
+      # Store for RTS smoother
+      table_xt_filter[i, ] <- t(xt_filter)
+      table_Pt_filter[, , i] <- Pt_filter
+      table_xt_prediction[i + 1, ] <- t(xt_prediction)
+      table_Pt_prediction[, , i + 1] <- Pt_prediction
+      table_et[i, ] <- et
+      table_L[, , i] <- L
+      table_y[i, ] <- y_prediction
+
+      nll <- nll + 0.5 * log(det(L)) + 0.5 * et %*% solve(L) %*% t(et)
+      ll_table[i] <- -(0.5 * length(yields[i, ]) * log(2 * pi) + 0.5 * log(det(L)) + 0.5 * et %*% solve(L) %*% t(et))
+    }
+
+    # === RTS Smoother ===
+    x_smooth <- table_xt_filter
+    P_smooth <- table_Pt_filter
+    P_lag <- array(0, dim = c(3, 3, T_ - 1))
+
+    for (t in (T_ - 1):1) {
+      Pt_pred_t1 <- table_Pt_prediction[, , t + 2]
+      Pt_filt_t <- table_Pt_filter[, , t]
+      J <- Pt_filt_t %*% t(A_1) %*% solve(Pt_pred_t1)
+
+      x_smooth[t, ] <- table_xt_filter[t, ] + as.vector(J %*% (x_smooth[t + 1, ] - table_xt_prediction[t + 2, ]))
+      P_smooth[, , t] <- Pt_filt_t + J %*% (P_smooth[, , t + 1] - Pt_pred_t1) %*% t(J)
+      P_lag[, , t] <- J %*% P_smooth[, , t + 1]
+    }
+
+    # === EM M-step: update A_0 and A_1 ===
+    Sxx <- Reduce("+", lapply(1:(T_ - 1), function(t) {
+      P_smooth[, , t] + tcrossprod(x_smooth[t, ])
+
+    }))
+    Sxy <- Reduce("+", lapply(2:T_, function(t) {
+      P_lag[, , t - 1] + x_smooth[t, ] %*% t(x_smooth[t - 1, ])
+
+    }))
+    Sx <- colSums(x_smooth[2:T_, , drop = FALSE])
+    Sx_prev <- colSums(x_smooth[1:(T_ - 1), , drop = FALSE])
+
+    A_1_new <- Sxy %*% solve(Sxx)
+    A_0_new <- matrix(Sx / (T_ - 1), ncol = 1) - A_1_new %*% matrix(Sx_prev / (T_ - 1), ncol = 1)
+
+    # === Convergence Check ===
+    if (norm(A_0_new - last_A_0, type = "2") < 1e-10 &&
+        norm(A_1_new - last_A_1, type = "2") < 1e-10) {
+      cat("Converged at iteration", k, "\n")
+      break
+    }
+
+    A_0 <- A_0_new
+    A_1 <- A_1_new
+    last_A_0 <- A_0
+    last_A_1 <- A_1
+
+    cat("Iteration:", k, "\n")
+    print(A_0)
+    print(A_1)
+    print(nll)
+  }
+
+  return(list(nll = nll, A_0 = A_0, A_1 = A_1,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+```
+
+
+
+
+
+
+# plots
+
+```{r}
+plot_kf_x <- function(kf_result, n_obs = NULL, state_names = c("Level", "Slope", "Curvature")) {
+  if (is.null(n_obs)) {
+    n_obs <- nrow(kf_result$xt_filter)
+  }
+
+  for (i in 1:3) {
+    df_real <- data.frame(
+      Time = 1:n_obs,
+      KF_Filtered = kf_result$xt_filter[, i],
+      KF_Predicted = kf_result$xt_prediction[-1, i],  # skip first row to align dimensions
+      CI_Upper = kf_result$xt_filter[, i] + 1.96 * sqrt(kf_result$Pt_filter[i, i, ]),
+      CI_Lower = kf_result$xt_filter[, i] - 1.96 * sqrt(kf_result$Pt_filter[i, i, ])
+    )
+
+    p <- ggplot(df_real, aes(x = Time)) +
+      geom_line(aes(y = KF_Filtered, color = "Filtered"), size = 1) +
+      geom_line(aes(y = KF_Predicted, color = "Predicted"), size = 1, linetype = "dashed") +
+      geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +
+      labs(title = paste("Kalman Filter -", state_names[i]),
+           y = state_names[i],
+           x = "Time") +
+      scale_color_manual(values = c("Filtered" = "red", "Predicted" = "black")) +
+      theme_minimal()
+
+    print(p)
+  }
+}
+
+
+plot_kf_yield_y <- function(kf_result, y_real, tenors, times = NULL) {
+  # Inputs:
+  #   kf_result: list containing 'y_hat' and 'cov_y' from Kalman Filter output
+  #   y_real: matrix or data.frame of real observed yields
+  #   tenors: numeric vector of tenors (e.g., c(0.25, 0.5, 1, 2, ...))
+  #   times: optional vector of actual dates for x-axis labels (defaults to 1:n)
+  
+  y_hat <- kf_result$y_hat
+  y_cov <- kf_result$cov_y
+
+  n_obs <- nrow(y_hat)
+  n_contract <- ncol(y_hat)
+
+  if (is.null(times)) {
+    times <- 1:n_obs
+  }
+
+  # Compute confidence intervals
+  ci_upper <- matrix(NA, n_obs, n_contract)
+  ci_lower <- matrix(NA, n_obs, n_contract)
+  for (i in 1:n_obs) {
+    std_err <- sqrt(diag(y_cov[,,i]))
+    ci_upper[i, ] <- y_hat[i, ] + 1.96 * std_err
+    ci_lower[i, ] <- y_hat[i, ] - 1.96 * std_err
+  }
+
+  # Plot for each tenor
+  for (i in 1:n_contract) {
+    df <- data.frame(
+      Time = 1:n_obs,
+      Real = y_real[, i],
+      Predicted = y_hat[, i],
+      CI_Upper = ci_upper[, i],
+      CI_Lower = ci_lower[, i]
+    )
+    colnames(df) <- c("Time", "Real","Predicted","CI_Upper","CI_Lower")
+
+    plot <- ggplot(df, aes(x = Time)) +
+      geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+      geom_line(aes(y = Predicted, color = "Predicted Data"), size = 1, linetype = "dashed") +
+      geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +
+      labs(
+        title = paste("Kalman Filter Prediction vs Real Data - Tenor", tenors[i]),
+        y = paste("Yield (Tenor =", tenors[i], "years)"),
+        x = "Time"
+      ) +
+      scale_color_manual(
+        name = "Legend",
+        values = c("Real Data" = "black", "Predicted Data" = "red")
+      ) +
+      scale_x_continuous(
+        breaks = seq(1, n_obs, length.out = 5),
+        labels = format(times[seq(1, n_obs, length.out = 5)])
+      ) +
+      ylim(0, 10)+
+      theme_minimal()
+
+    print(plot)
+  }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+

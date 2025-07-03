@@ -4,140 +4,120 @@ output: html_document
 date: "2025-04-15"
 ---
 
-```{r setup, include=FALSE}
-BF_data
-BF_5year <- BF_data[2518:3847]
-BF_5year
-```
 
 ```{r}
 library(MASS)
 library(ggplot2)
 library(tibble)
 library(rugarch)
+library(xts)
+library(dplyr)
+library(lubridate)
+library(MASS)
 ```
 
 # Functions
 
 
-```{r}
-basis <- function(x, degree, i, knots){
-  if(degree == 0){
-    B <- ifelse((x>=knots[i])&(x<knots[i+1]),1,0)
-  } else {
-    if((knots[degree + i] - knots[i]) == 0){
-      if(x != knots[i+degree]){
-        alpha1 <- 0
-      } else {
-        return(1)
-      }
-    } else {
-      alpha1 <- (x-knots[i])/(knots[degree+i] - knots[i])
-    }
-    if((knots[i+degree+1] - knots[i+1]) == 0){
-      if(x != knots[i+degree]){
-        alpha2 <- 0
-      } else {
-        return(1)
-      }
-    } else {
-      alpha2 <- (knots[i+degree+1] - x) / (knots[i+degree+1] - knots[i+1])
-    }
-    B <- alpha1 * basis(x, (degree-1), i, knots) + 
-      alpha2*basis(x, (degree-1), (i+1), knots)
-  }
-  return(B)
-}
-```
 
-Construct the matrix $\mathbf{B}$, column by column. Matrix $B$ contains the basis functions computed through the Cox-deBoor recursive formulas using the function defined in the codechunk above, evaluated at different times to maturity (rows) and at different knot intervals (columns). For more details, check FURM on canvas.
-
-```{r}
-matrix_b <- function(x, degree=3, int_knots) { 
-  # the x argument takes in a vector of time values that 
-  # will be used to evaluate a design matrix of basis functions 
-  # the degree argument specifies the highest degree of polynomials for
-  # the basis functions
-  # the int_knots argument takes in a vector of knots that will be used 
-  # to determine the intervals of the piecewise function
-  bound_knots <- int_knots[c(1, length(int_knots))] # this line creates bound knots
-  knots <- c(rep(bound_knots[1], (degree+1)), int_knots[c(-1, -length(int_knots))], rep(bound_knots[2], (degree+1)))
-  # the line above adds a couple of extra knots to each end of the int_knots vector because of the Cox-deBoor recursion
-  K <- length(int_knots) + degree - 1 # number of columns in the Basis matrix
-  B.mat <- matrix(0,nrow = length(x), ncol = K) # initialize the matrix
-  for(j in 1:K) {
-    B.mat[,j] <- sapply(X = x, FUN = basis, degree = degree, i = j, knots = knots) # add each column, one by one
-  }
-  return(B.mat) # return the matrix
-}
-```
 
 
 ```{r}
-interp_yc <- function(yield_list, int_knots, degree = 3, d, last_tenor){
+interp_yc <- function(ttms, yieldMat,newTen, degree = 3){
+  
   # yield_list: parameter of the form of a list of data frames containing ZCB spot rate
   # int knots: the interior knots used for b-spline construction
   # degree: highest degree of polynomials for the basis functions
   # d: the date chosen to interpolate from the list
   # last_tenor: last tenor to interpolate in a day
-  yield_list[[d]] <- data.frame(Maturity = yield_list[[d]]$Maturity,
-                                ZERO_YLD1 = yield_list[[d]]$ZERO_YLD1)
-  yc_df_pre <- rbind(data.frame(Maturity = 0, ZERO_YLD1 = 0), na.omit(yield_list[[d]]))
-  last_row <- which(round(yc_df_pre$Maturity,3) == last_tenor)
-  yc_df <- yc_df_pre[1:last_row,]
-  yields <- c(0, yc_df$ZERO_YLD1)
-  maturities <- c(0, as.numeric(yc_df$Maturity))
-  x <- as.numeric(maturities) # maturity dates
-  B <- matrix_b(x, degree=degree, int_knots = int_knots) 
+  
+  # Initialize Funcs
+  
+  basis <- function(x, degree, i, knots){
+    if(degree == 0){
+      B <- ifelse((x>=knots[i])&(x<knots[i+1]),1,0)
+    } else {
+      if((knots[degree + i] - knots[i]) == 0){
+        if(x != knots[i+degree]){
+          alpha1 <- 0
+        } else {
+          return(1)
+        }
+      } else {
+        alpha1 <- (x-knots[i])/(knots[degree+i] - knots[i])
+      }
+      if((knots[i+degree+1] - knots[i+1]) == 0){
+        if(x != knots[i+degree]){
+          alpha2 <- 0
+        } else {
+          return(1)
+        }
+      } else {
+        alpha2 <- (knots[i+degree+1] - x) / (knots[i+degree+1] - knots[i+1])
+      }
+      B <- alpha1 * basis(x, (degree-1), i, knots) + 
+        alpha2*basis(x, (degree-1), (i+1), knots)
+    }
+    return(B)
+  }
+  
+  # chug them into a matrix
+  matrix_b <- function(x, degree=3, int_knots) { 
+    # the x argument takes in a vector of time values that 
+    # will be used to evaluate a design matrix of basis functions 
+    # the degree argument specifies the highest degree of polynomials for
+    # the basis functions
+    # the int_knots argument takes in a vector of knots that will be used 
+    # to determine the intervals of the piecewise function
+    bound_knots <- int_knots[c(1, length(int_knots))] # this line creates bound knots
+    knots <- c(rep(bound_knots[1], (degree+1)), int_knots[c(-1, -length(int_knots))], rep(bound_knots[2], (degree+1)))
+    # the line above adds a couple of extra knots to each end of the int_knots vector because of the Cox-deBoor recursion
+    K <- length(int_knots) + degree - 1 # number of columns in the Basis matrix
+    B.mat <- matrix(0,nrow = length(x), ncol = K) # initialize the matrix
+    for(j in 1:K) {
+      B.mat[,j] <- sapply(X = x, FUN = basis, degree = degree, i = j, knots = knots) # add each column, one by one
+    }
+    return(B.mat) # return the matrix
+  }
+
+  int_knots <- ttms
+  N <- length(ttms)
+  if(N %in% c(5, 6)){
+    int_knots <- c(0, quantile(ttms, probs = c(0, 0.5, 1)))
+  } else if(N %in% c(7,8,9)){
+    int_knots <- c(0,quantile(ttms, probs = c(0, 0.33, 0.66, 1)))
+  } else if(N %in% 10:15){
+    int_knots <- c(0,quantile(ttms, probs = c(0, 0.25, 0.5, .75, 1)))
+  } else {
+    int_knots <- c(0,quantile(ttms, probs = c(0, 0.20, 0.4, .6, .8, 1)))
+  }
+  
+  
+  yields <- cbind(rep(0, nrow(yieldMat)),as.matrix(yieldMat))
+  
+  
+  x <- as.numeric(c(0,ttms)) # maturity dates
+  B <- matrix_b(x, degree=degree, int_knots = ,int_knots)
   B_t_B <- t(B) %*% B
+  
   # B is the design matrix on which the least squares coefficients will be calculated
   
-  alphas <- solve(B_t_B) %*% t(B) %*% yields # OLS Formula for coefficients
-  x2 <- seq(1/12, last_tenor, 1/12) # this range is used to simulate a continuous yield curve
+  alphas <- solve(B_t_B) %*% t(B) %*% t(yields) # OLS Formula for coefficients
+  x2 <- newTen # this range is used to simulate a continuous yield curve
   B2 <- matrix_b(x2, degree = degree, int_knots = int_knots) 
   # B2 is the matrix of basis functions but evaluated at a 'continuous' time (not really but close enough)
   
-  interpolated_yields <- data.frame(Maturity = x2, ZERO_YLD1 = B2 %*% alphas) # create dataframes for plotting
-  og_yields <- data.frame(ttm = maturities, yield = yields)
-
+  interpolated_yields <- t(B2 %*% alphas) # create dataframes for plotting
+  colnames(interpolated_yields) <- newTen
   return(interpolated_yields)
 }
+
+# interp_yc(tenors_raw, treasury_yields,tenors_bt, degree = 3)
+
 ```
 
 Interpolate a list of data with different dates.
 
-```{r}
-interpolate_list <- function(yield_list, start, T_, degree = 3){
-  # yield_list: Parameter of the form of a list of data frames containing ZCB spot rate
-  # start: starting date from the yield_list list
-  # T_: length of time window
-  # degree: highest degree of polynomials for the basis functions
-  interpolated_yc <- list()
-  k <- 1
-  for(i in start:(start + T_ - 1)){
-    lt_max <- max(yield_list[[i]]$Maturity) # This line of code basically chops all yields beyond 20
-    avail_ylds <- na.omit(yield_list[[i]]$ZERO_YLD1)
-    maturities <- yield_list[[i]]$Maturity
-    N <- length(avail_ylds)
-    if(N %in% c(5, 6)){
-      int_knots <- c(0, quantile(maturities, probs = c(0, 0.5, 1)))
-    } else if(N %in% c(7,8,9)){
-      int_knots <- c(0,quantile(maturities, probs = c(0, 0.33, 0.66, 1)))
-    } else if(N %in% 10:15){
-      int_knots <- c(0,quantile(maturities, probs = c(0, 0.25, 0.5, .75, 1)))
-    } else {
-      int_knots <- c(0,quantile(maturities, probs = c(0, 0.20, 0.4, .6, .8, 1)))
-    }
-    interpolated_yc[[k]] <- interp_yc(yield_list = yield_list,
-                                      int_knots = int_knots,
-                                      d = i,
-                                      last_tenor = lt_max,
-                                      degree = degree)[3:240,]
-    k <- k + 1
-  }
-  return(interpolated_yc)
-}
-```
 
 Kalman Filter basis calculation 
 ```{r}
@@ -298,43 +278,59 @@ yule_walker_ar1 <- function(ts) {
 ```
 
 OLS for Nelson Siegel
+
 ```{r}
-fit_nelson_siegel <- function(yield_list, lambda, start, tenors, T_){
-
-
-  maturities <- tenors
-  N <- length(maturities)
+fit_dynamic_NS <- function(yields, lambda, tenors){
+  N <- length(tenors)
+  T_ <- nrow(yields)
   
   term1 <- 1
-  term2 <- (1 - exp(-maturities*lambda)) / (maturities*lambda)
-  term3 <- ((1 - exp(-maturities*lambda)) / (maturities*lambda)) - exp(-maturities*lambda)
-  Phi <- cbind(term1, term2, term3) # Construct Phi matrix for NS
+  term2 <- (1 - exp(-tenors*lambda)) / (tenors*lambda)
+  term3 <- ((1 - exp(-tenors*lambda)) / (tenors*lambda)) - exp(-tenors*lambda)
+  Phi <- cbind(term1, term2, term3)
   
-  Y_mat <- matrix(0, nrow = N, # matrix of N by T, containing yields for each tenor (columns)
-                  ncol = T_) # where each column represents a different date
-  j <- 1
-  for(t in start:(start + T_- 1)){
-    Y_mat[,j] <- yield_list[t]
-    j <- j + 1
-    phitphi_1phit <- solve(t(Phi) %*% Phi, t(Phi)) # OLS for the coefficients for every single day
-    betas_t <- phitphi_1phit %*% Y_mat  
-    betas <- rowSums(betas_t) / T_ # average all coefficients
-    eps <- matrix(0, nrow = N, ncol = T_) # matrix of errors for each day (column) and each tenor (row)
-    for(t in 1:T_){
-      eps[,t] <- Y_mat[,t] - Phi %*% betas # Populate errors
-    }
-    sig_hat2 <- sum(as.vector(eps)^2) / (N * T_ - 3) # take mean squared error (MLE Estimator)
+  
+  betas <- matrix(NA, nrow =T_, ncol = 3)
+  eps <- matrix(NA, nrow = T_, ncol = N)
+  for(i in 1:T_){
+    m <- solve(t(Phi) %*% Phi, t(Phi))
+    betas[i,] <- (solve(t(Phi) %*% Phi, t(Phi))) %*% as.matrix(yields[i,])
+    eps[i,] <- yields[i,] - Phi %*% betas[i,]
+    
   }
-
+  sig_hat2 <- sum(eps^2) / (T_ * (N - 3))
+  cov_mat <- t(eps) %*% eps / (T_ - 3)
+  
   return(list(betas = betas, # fitted betas static: 1*3   dynamic: T*3
               sigma2 = sig_hat2, # MSE
               lambda = lambda, # lambda(input)
-              cov_mat_betas = sig_hat2 * solve(t(Phi) %*% Phi), # Nelson Siegel design matrix N*3
+              cov_mat = cov_mat, 
               eps = eps,
-              Phi = Phi)) # residuals N*T
-  
+              Phi = Phi))
 }
+
+
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r setup, include=FALSE}
+BF_data
+BF_5year <- BF_data[2518:3847]
+BF_5year
+```
+
 
 ```{r}
 tenors <- c(1, 5, 10, 30)
@@ -342,15 +338,24 @@ dim(BF_5year)
 ```
 
 ```{r}
-tsBetas <- matrix(NA, ncol = nrow(BF_5year), nrow = 3)
+tsBetas <- matrix(NA, ncol = nrow(BF_5year), nrow = 3) # OLS fit for the 
 obs_res <- matrix(NA, ncol = nrow(BF_5year), nrow = 1)
+times <- as.character(as.POSIXct(BF_5year[,0]))
+
 for(i in 1:nrow(BF_5year)) {
   ols_fit <- fit_nelson_siegel(BF_5year, 0.1, tenors = c(5, 10, 20, 30), start = i, T_ = 1)
   tsBetas[,i] <- ols_fit$betas
   obs_res[,i] <- ols_fit$sigma2
 }
+
+colnames(tsBetas) <- times
+colnames(obs_res) <- times
+
 tsBetas[,1]
-obs_res[,]
+obs_res[,1]
+
+dim(tsBetas)
+dim(obs_res)
 ```
 
 ```{r}
@@ -369,8 +374,7 @@ tenors <- c(5, 10, 20, 30) # tenor of each time
 mats_matrix_real <- matrix(rep(tenors, each = nrow(BF_5year)), nrow = nrow(BF_5year), byrow = FALSE)
 
 
-parameters <- c(AR1_level$c, AR1_slope$c, AR1_curv$c, AR1_level$phi, AR1_slope$phi, AR1_curv$phi, AR1_level$sigma2, AR1_slope$sigma2,
-            AR1_curv$sigma2, rep(sigOLS2, length(tenors)))
+parameters <- c(AR1_level$c, AR1_slope$c, AR1_curv$c, AR1_level$phi, AR1_slope$phi, AR1_curv$phi, AR1_level$sigma2, AR1_slope$sigma2, AR1_curv$sigma2, rep(sigOLS2, length(tenors)))
 
 real_result<- KF_NS(parameters, BF_5year, mats_matrix_real, 0.1)
 head(real_result$y_hat) # kalman filter prediction for yield data
@@ -379,6 +383,8 @@ head(real_result$y_hat) # kalman filter prediction for yield data
 ```
 ```{r}
 BF_5year
+Y_res <- real_result$y_hat - BF_5year
+
 ```
 
 ```{r}
@@ -387,18 +393,451 @@ predicted_x <- real_result$xt_prediction[-301,]
 
 
 Beta_res <- filtered_x - predicted_x
-Beta_res
+head(Beta_res)
+```
+
+
+
+```{r}
+library(ggplot2)
+
+# Ensure real data is defined
+y_real <- BF_5year  # Actual yield data used in KF
+
+# Extract KF predictions and covariances
+y_hat <- real_result$y_hat
+y_cov <- real_result$cov_y
+
+# Set dimensions
+n_obs <- nrow(y_hat)
+n_contract <- ncol(y_hat)
+
+# Precompute confidence intervals
+ci_upper <- matrix(NA, n_obs, n_contract)
+ci_lower <- matrix(NA, n_obs, n_contract)
+for (i in 1:n_obs) {
+  std_err <- sqrt(diag(y_cov[,,i]))
+  ci_upper[i, ] <- y_hat[i, ] + 1.96 * std_err
+  ci_lower[i, ] <- y_hat[i, ] - 1.96 * std_err
+}
+
+# Plot for each tenor (column)
+for (i in 1:n_contract) {
+  df <- data.frame(
+    Time = 1:n_obs,
+    Real = y_real[, i],
+    Predicted = y_hat[, i],
+    CI_Upper = ci_upper[, i],
+    CI_Lower = ci_lower[, i]
+  )
+  colnames(df) <- c("Time", "Real", "Predicted", "CI_Upper", "CI_Lower")
+  
+  plot <- ggplot(df, aes(x = Time)) +
+    geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+    geom_line(aes(y = Predicted, color = "Predicted Data"), size = 1, linetype = "dashed") +
+    geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +
+    labs(
+      title = paste("Kalman Filter Prediction vs Real Data - Tenor", tenors[i]),
+      y = paste("Yield (Years, Tenor =", tenors[i], ")"),
+      x = "Time"
+    ) +
+    scale_color_manual(
+      name = "Legend",
+      values = c("Real Data" = "black", "Predicted Data" = "red")
+    ) +
+    theme_minimal()
+  
+  print(plot)
+}
+
+```
+
+```{r}
+filtered_x <- real_result$xt_filter
+predicted_x <- real_result$xt_prediction[-301,]
+
+
+Beta_res <- filtered_x - predicted_x
+head(Beta_res)
+```
+
+
+
+```{r}
+log_returns <- apply(BF_5year, 2, function(x) diff(log(x)))
+head(log_returns)
+
+```
+
+
+```{r}
+rownames(filtered_x) <-  times
+latent_log_returns <- apply(filtered_x, 2, function(x) diff(log(abs(x))))
+head(latent_log_returns)
+
+```
+
+```{r}
+dim(latent_log_returns)
+RV_level_mat <- matrix(NA, nrow = nrow(log_returns), ncol = 3) 
+```
+
+```{r}
+get_RV <- function(log_returns, latent_log_returns, tenors, times){
+  
+  latent_RV_day <- as.data.frame(latent_log_returns) %>%
+  mutate(day = as.Date(rownames(latent_log_returns))) %>%
+  group_by(day) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+  
+  
+  latent_RV_week <- as.data.frame(latent_log_returns) %>%
+  mutate(week = floor_date(as.Date(rownames(latent_log_returns)), "week")) %>%
+  group_by(week) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+
+  
+  latent_RV_month <- as.data.frame(latent_log_returns) %>%
+  mutate(month = floor_date(as.Date(rownames(latent_log_returns)), "month")) %>%
+  group_by(month) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+
+  RV_y <- as.data.frame(log_returns) %>% mutate(across(where(is.numeric), ~ .^2))
+  
+  # RV_y <- as.data.frame(log_returns) %>%
+  # mutate(day = as.Date(rownames(log_returns))) %>%
+  # group_by(day) %>%
+  # summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE))) %>%
+  # select(2:(length(tenors)+1))
+
+  # RV_week <- as.data.frame(log_returns) %>%
+  # mutate(week = floor_date(as.Date(rownames(log_returns)), "week")) %>%
+  # group_by(week) %>%
+  # summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+  # 
+  # RV_month <- as.data.frame(log_returns) %>%
+  # mutate(month = floor_date(as.Date(rownames(log_returns)), "month")) %>%
+  # group_by(month) %>%
+  # summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+  
+  new_names <- c("RV_y","RV_level_day", "RV_level_week", "RV_level_month",
+  "RV_slope_day", "RV_slope_week", "RV_slope_month",
+  "RV_curvature_day", "RV_curvature_week", "RV_curvature_month"
+)
+  
+  latent_RV_all <- as.data.frame(latent_log_returns) %>%
+  mutate(
+    day   = as.Date(rownames(.)),
+    week  = floor_date(day, "week"),
+    month = floor_date(day, "month")
+  ) %>%
+  left_join(latent_RV_day,   by = "day") %>%
+  left_join(latent_RV_week,  by = "week") %>%
+  left_join(latent_RV_month, by = "month") %>%
+  dplyr::select(7:15) # messed up by MASS package  
+  
+  RV_array <- array(NA, dim = c(nrow(RV_y), length(new_names), length(tenors)))
+
+  for (i in seq_along(tenors)) {
+    RV_matrix <- cbind(RV_y[, i], latent_RV_all) %>%
+    rename_with(~ new_names, .cols = everything()) %>%
+    as.matrix()
+  
+    RV_array[, , i] <- RV_matrix
+  
+  }
+  return(RV_array)
+}
+
+RV_array <- get_RV(log_returns, latent_log_returns, tenors, times)
+
+```
+
+
+```{r}
+RV_trans_mat <- matrix(NA, 4, 9)
+colnames(RV_trans_mat) <- c("RV_level_day", "RV_level_week", "RV_level_month",
+  "RV_slope_day", "RV_slope_week", "RV_slope_month",
+  "RV_curvature_day", "RV_curvature_week", "RV_curvature_month")
+
+RV_itcp_mat <- matrix(NA, 4, 1)
+for(i in 1:length(tenors)){
+  model <- lm(RV_y ~., data = as.data.frame(RV_array[,,i]))
+  coef <- stepAIC(model, direction = "backward")$coefficient
+  RV_trans_mat[i, names(coef[2: length(coef)])] <- coef[2: length(coef)]
+  
+  RV_itcp_mat[i,] <- coef[1]
+}
+
+RV_trans_mat[is.na(RV_trans_mat)] <- 0
+RV_itcp_mat[is.na(RV_itcp_mat)] <- 0
+
+```
+
+
+```{r}
+epsilon_tran <- matrix(NA, 4, 4)
+rep(sigOLS2, length(tenors))
+
+RV_trans_mat
+RV_itcp_mat
+```
+
+
+```{r}
+
+RV_Y <- RV_array[ , 1, ]
+sigma_v <- diag( rep(sigOLS2, length(tenors)))
+
+RV_itcp_mat + RV_trans_mat %*% t(RV_Y[1,])
+
+RV_array[1,,1]
+dim(RV_array[1,-1,1])
+(RV_itcp_mat + RV_trans_mat %*% RV_array[1,-1,1]) %*% sigma_v
+sigma_v
+sigma_v <- diag(as.vector(RV_itcp_mat + RV_trans_mat %*% RV_array[1,-1,1]) ) %*% sigma_v
 ```
 
 
 
 
 
+```{r}
+
+KF_NS_HAR <- function(par, yt, mats, lam, RV_itcp, RV_trans, scale) {
+  # Standard Kalman Filter for Nelson Siegel model
+  # Model:
+  #   y_t = d_t + F_t' x_t + f_t + v_t, v_t ~ N(0, V), observation equation
+  #   x_t = c + G x_{t-1} + w_t, w_t ~ N(0, W), state equation
+  #   f_t = b*t + beta*cos(2*pi*t*dt) + eta*sin(2*pi*t*dt), seasonal effect
+  # Inputs:
+  #   par: a vector of parameters
+  #   yt: the logarihm of futures prices
+  #   T: maturities
+  #   delivery_time: a vector of date, which is necessary if seasonality is "Constant"
+  #   dt: delta t
+  #   smoothing: a boolean variable indicate if Kalman Smoothing is required
+  #   seasonality: "Constant" or "None"
+  #   RV_trans: transition matrix of RV
+  # Outputs:
+  #   nll: the negative log likelihood
+  #   ll_table: a vector to store cumulative log-likelihood at each time point - used to calculate Sandwich variance
+  #   table_at_filter: a nT*2 matrix gives the filtered values of state variables.
+  #   table_at_prediction: a (nT+1)*2 matrix gives the predicted values of state variables.
+  #   table_at_smoother: a nT*2 matrix gives the smoothed values of state variables. The algorithm of Kalman Smoother is given by Bierman (1973) and De Jong (1989).
+  #   ft: seasonal effect
+
+ # require(lubridate)
+  times <- as.character(rownames(yt))
+  n_obs <- dim(yt)[1]
+  n_contract <- dim(yt)[2]
+  tenors <- mats[1,]
+
+  table_xt_filter <- matrix(0, nrow = n_obs, ncol = 3) # a_t|t
+  table_Pt_filter <- array(0, dim = c(3, 3, n_obs)) # P_t|t
+  table_xt_prediction <- matrix(0, nrow = n_obs+1, ncol = 3) # a_t|t-1
+  table_Pt_prediction <- array(0, dim = c(3, 3, n_obs+1)) # P_t|t-1
+  
+  nll <- 0 # negative log-likelihood
+  ll_table <- matrix(0, nrow = 1, ncol = n_obs) # table of log-likelihood
+
+  table_et <- matrix(0, nrow = n_obs, ncol = n_contract) # e_t
+  table_L <- array(0, dim = c(n_contract, n_contract, n_obs)) # Covariance of y
+  table_y <- matrix(0, nrow = n_obs, ncol = n_contract) # y_hat
+
+  # Parameters
+  if (length(par) != 9+n_contract) {
+    stop("Incorrect number of parameters. ")
+  }
+
+  phi0 <- c(par[1], par[2], par[3])
+  phi1 <- diag(c(par[4], par[5], par[6]))
+  x0 <- phi0 / (1 - diag(phi1))
+  #lam <- par[7]
+  sigma_w <- diag( par[7:9] )
+  sigma_v <- diag( par[10: length(par)] )
+  sigma_v_0 <- sigma_v
+  
+  # Initialization
+  xt_filter <- x0
+  Pt_filter <- diag( diag(sigma_w) / (1 - diag(phi1)^2) )
+  
+  log_return_x <- matrix(NA, nrow = n_obs, ncol = 3, dimnames = list(times, NULL))
+  log_return_y <- rbind(rep(0,n_contract), apply(yt, 2, function(x) diff(log(x))))
+  rownames(log_return_y) <- times
+  
+  RV_mat_x <- matrix(NA, nrow = n_obs, ncol = 9, dimnames = list(times, NULL))
+  RV_mat_y <- matrix(NA, nrow = n_obs, ncol = n_contract, dimnames = list(times, NULL))
+
+  # Kalman Filter
+  for (i in 1:n_obs) {
+    lambda <- rbind(rep(1, n_contract),
+                    (1 - exp(-lam * mats[i,])) / (lam * mats[i,]),
+                    (1 - exp(-lam * mats[i,])) / (lam * mats[i,]) - exp(-lam * mats[i,]))
+
+    # Prediction step
+    xt_prediction  <- phi0 + phi1 %*% xt_filter # a_t+1|t
+    Pt_prediction <- phi1 %*% Pt_filter %*% t(phi1) + sigma_w # P_t+1|t
+    y_prediction <- t(lambda) %*% xt_prediction # ytilde_t|t-1 = d_t + F_t a_t|t-1
+
+    # Filter step
+    et <- yt[i, ] - t(y_prediction) # e_t = y_t - ytilde_t|t-1
+    L <- t(lambda) %*% Pt_prediction %*% lambda + sigma_v # Covariance matrix of et
+    invL <- solve(L) # inverse of L
+    K <- Pt_prediction %*% lambda %*% invL # Kalman gain matrix: K_t
+
+    xt_filter <- xt_prediction + K %*% t(et) # a_t
+    Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction # P_t
+    #Pt_filter <- (diag(3) - K %*% t(lambda)) %*% Pt_prediction %*% t(diag(3) - K %*% t(lambda)) + K %*% sigma_v %*% t(K)
+
+    # Update tables
+    
+    table_xt_filter[i, ] <- t(xt_filter)
+    table_Pt_filter[, , i] <- Pt_filter
+    table_xt_prediction[i+1, ] <- t(xt_prediction)
+    table_Pt_prediction[, , i+1] <- Pt_prediction
+    table_et[i, ] <- et
+    table_L[, , i] <- L
+    table_y[i, ] <- y_prediction
+    
+    if(i == 1){
+      log_return_x[i,] <- log(abs(t(xt_filter)/x0))
+      y_0 <- matrix(rep(0,n_contract), nrow = 1, ncol = 20)
+      rownames(y_0) <- times[i]
+      RV_array <- get_RV(y_0, log_return_x[i,, drop = FALSE], tenors = tenors, times = times)
+      RV_mat_x <- t(as.matrix(RV_array[ , 2:10, 1]))
+    }else{
+      
+      log_return_x[i,] <- log(abs(t(xt_filter)/table_xt_filter[i-1, ]))
+     
+      RV_array <- get_RV(log_return_y[1:i,,drop = FALSE], log_return_x[1:i,, drop = FALSE], tenors = tenors, times = times[i])
+      
+      RV_mat_x <- as.matrix(RV_array[ , 2:10, 1])
+     
+    }
+
+    v_trans <- diag(as.vector(RV_itcp_mat + RV_trans_mat %*% RV_mat_x[i, ]) ) 
+    
+    sigma_v <- scale * v_trans %*% sigma_v_0 %*% v_trans
+    
+    # if (det(L)<0) {
+    #   message(i)
+    #   message("matrix is not semi positive definite (KF)")
+    # }
+    
+    # Update likelihood
+    nll <- nll + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et)
+    
+    ll_table[i] <- -(0.5*length(yt[i, ])*log(2*pi) + 0.5*log(det(L)) + 0.5*et %*% solve(L) %*% t(et))
+  }
+
+  return(list(nll = nll,
+              ll_table = ll_table,
+              xt_filter = table_xt_filter,
+              Pt_filter = table_Pt_filter,
+              xt_prediction = table_xt_prediction,
+              cov_y = table_L,
+              y_hat = table_y))
+}
+
+
+# 
+# parameters <- c(AR1_level$c, AR1_slope$c, AR1_curv$c, AR1_level$phi, AR1_slope$phi, AR1_curv$phi, AR1_level$sigma2, AR1_slope$sigma2, AR1_curv$sigma2, rep(sigOLS2, length(tenors_bt)))
+# mats_matrix_real <- matrix(rep(tenors, each = nrow(BF_5year)), nrow = nrow(BF_5year), byrow = FALSE)
+
+KF_HAR_result <- KF_NS_HAR(parameters, bt_treasury_yields, mats_matrix_real, 0.1, RV_itcp, RV_trans, scale = 5000) 
+KF_HAR_result$nll
 
 
 
+scale_grid <- seq(1000, 15000, by = 1000)
+model_list <- list()
+
+for (i in seq_along(scale_grid)){
+  print(i)
+  model_list[[i]] <- KF_NS_HAR(parameters, bt_treasury_yields, mats_matrix_real, 0.1, RV_itcp, RV_trans, scale = scale_grid[i]) 
+  
+}
 
 
+best_scale <- scale_grid[which.min(nll_grid)]
+KF_HAR_result <- KF_NS_HAR(parameters, bt_treasury_yields, mats_matrix_real, 0.1, RV_itcp, RV_trans, scale = 100000000) 
+# good scale: 100000000
+
+KF_HAR_result$nll
+real_result$nll
+
+for (i in seq_along(scale_grid)){
+  filtered_x_HAR <- model_list[[i]]$xt_filter
+  predicted_x_HAR <- model_list[[i]]$xt_prediction[-1,]
+  
+  Y_res_HAR <- model_list[[i]]$y_hat - bt_treasury_yields
+  Beta_res_HAR <- filtered_x_HAR - predicted_x_HAR
+  
+  # Compare the SSE 
+  print(sum((Y_res_HAR^2)))
+  print(colSums(Y_res_HAR^2))
+    
+}
+```
+
+
+```{r}
+
+# Ensure real data is defined
+y_real <- bt_treasury_yields  # Actual yield data used in KF
+
+# Extract KF predictions and covariances
+y_hat <- KF_HAR_result$y_hat
+y_cov <- KF_HAR_result$cov_y
+
+# Set dimensions
+n_obs <- nrow(y_hat)
+n_contract <- ncol(y_hat)
+
+# Precompute confidence intervals
+ci_upper <- matrix(NA, n_obs, n_contract)
+ci_lower <- matrix(NA, n_obs, n_contract)
+for (i in 1:n_obs) {
+  std_err <- sqrt(diag(y_cov[,,i]))
+  ci_upper[i, ] <- y_hat[i, ] + 1.96 * std_err
+  ci_lower[i, ] <- y_hat[i, ] - 1.96 * std_err
+}
+
+# Plot for each tenor (column)
+for (i in 1:n_contract) {
+  df <- data.frame(
+    Time = 1:n_obs,
+    Real = y_real[, i],
+    Predicted = y_hat[, i],
+    CI_Upper = ci_upper[, i],
+    CI_Lower = ci_lower[, i]
+  )
+  colnames(df) <- c("Time", "Real", "Predicted", "CI_Upper", "CI_Lower")
+  
+  plot <- ggplot(df, aes(x = Time)) +
+    geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+    geom_line(aes(y = Predicted, color = "Predicted Data"), size = 1, linetype = "dashed") +
+    geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +
+    labs(
+      title = paste("Kalman Filter Prediction vs Real Data - Tenor", tenors[i]),
+      y = paste("Yield (Years, Tenor =", tenors[i], ")"),
+      x = "Time"
+    ) +
+    scale_color_manual(
+      name = "Legend",
+      values = c("Real Data" = "black", "Predicted Data" = "red")
+    ) +scale_x_continuous(
+    breaks = seq(1, n_obs, length.out = 5),  # Adjust number of ticks as needed
+    labels = format(times[seq(1, n_obs, length.out = 5)])  # Format as dates
+  )+
+    theme_minimal()
+  
+  print(plot)
+}
+Y_res <- KF_HAR_result$y_hat - bt_treasury_yields
+sum((Y_res^2))
+```
 
 
 

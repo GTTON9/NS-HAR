@@ -1,0 +1,467 @@
+---
+title: "Bond NS_HAR"
+output: html_document
+date: "2025-05-20"
+---
+
+```{r}
+library(purrr)
+```
+
+
+```{r}
+head(treasury_yields)
+```
+
+
+```{r}
+tenors_raw <- c(1/12, 1/4, 1/2, 1, 2, 3, 5, 7, 10, 20, 30)
+tenors_bt <- c(1, 5, 10, 20)
+NS_name <- c("level","slope","curvature")
+
+
+colnames(treasury_yields) <- as.character(c(1/12, 1/4, 1/2, 1, 2, 3, 5, 7, 10, 20, 30))
+bt_treasury_yields <- interp_yc(tenors_raw, treasury_yields,tenors_bt, degree = 3)
+head(bt_treasury_yields)
+```
+
+```{r}
+lambda_grid <- seq(0, 0.5, 0.01)
+best_global_lambda <- get_lambda(bt_treasury_yields, lambda_grid, tenors = tenors_bt) # best global lambda
+```
+
+
+```{r}
+bt_split <- as.data.frame(bt_treasury_yields) %>%
+  mutate(Date = as.Date(rownames(.))) %>%
+  mutate(
+    Year = format(Date, "%Y"),
+    Half = ifelse(as.numeric(format(Date, "%m")) <= 6, "H1", "H2")
+  ) %>% 
+  mutate(Group = paste0(Year, "-", Half))
+
+
+bt_split_list <- bt_split %>%
+  split(.$Group) %>%
+  map(~ .x %>%
+        select(where(is.numeric)) %>%  # Keep only numeric columns
+        as.matrix()
+  )
+
+best_lambda_half_year <- numeric()
+for( i in seq_along(bt_split_list)){
+  best_lambda_half_year[i] <- get_lambda(bt_split_list[[i]], lambda_grid, tenors = tenors_bt) 
+}
+
+best_lambda_half_year
+```
+
+
+
+```{r}
+tsBetas <- matrix(NA, ncol = nrow(bt_treasury_yields), nrow = 3) # OLS fit for the 
+obs_res <- matrix(NA, ncol = nrow(bt_treasury_yields), nrow = 1)
+times <- as.character(as.POSIXct(treasury_yields[,0]))
+
+bt_ols_fit <- fit_dynamic_NS(bt_treasury_yields, lambda = best_global_lambda, tenors_bt)
+ols_betas <- as.matrix(bt_ols_fit$betas)
+ols_res <- as.matrix(bt_ols_fit$eps)
+
+rownames(ols_betas) <- times
+colnames(ols_betas) <- NS_name
+rownames(ols_res) <- times
+colnames(ols_res) <- tenors_bt
+bt_ols_fit
+```
+
+
+```{r}
+AR1_level <- yule_walker_ar1(ols_betas[,1])
+AR1_slope <- yule_walker_ar1(ols_betas[,2])
+AR1_curv <- yule_walker_ar1(ols_betas[,3])
+```
+
+
+
+```{r}
+mats_matrix_real <- matrix(rep(tenors_bt, each = nrow(bt_treasury_yields)), nrow = nrow(bt_treasury_yields), byrow = FALSE)
+
+parameters <- c(AR1_level$c, AR1_slope$c, AR1_curv$c, AR1_level$phi, AR1_slope$phi, AR1_curv$phi, AR1_level$sigma2, AR1_slope$sigma2, AR1_curv$sigma2, rep(bt_ols_fit$sigma2, length(tenors_bt)))
+
+real_result<- KF_NS(parameters, bt_treasury_yields, tenors_bt, 0.1)
+parameters
+head(real_result$y_hat) # kalman filter prediction for yield data
+real_result$nll
+```
+
+```{r}
+plot_kf_x(real_result)
+plot_kf_yield_y(real_result, bt_treasury_yields, tenors_bt)
+```
+
+
+### AR estimation
+```{r}
+filtered_x <- real_result$xt_filter
+predicted_x <- real_result$xt_prediction[-1,]
+
+Y_res <- real_result$y_hat - bt_treasury_yields
+Beta_res <- filtered_x - predicted_x
+
+# Compare the SSE 
+colSums(Y_res^2)
+colSums(Beta_res^2)
+sum((Y_res^2))
+real_result$nll
+```
+
+
+# Gradeint Descent
+```{r}
+GD_res <- KF_NS_GD_diag(parameters, bt_treasury_yields, tenors_bt, 0.3)
+
+```
+
+```{r}
+plot_kf_x(GD_res)
+plot_kf_yield_y(GD_res, bt_treasury_yields, tenors_bt)
+```
+
+
+```{r}
+filtered_x <- GD_res$xt_filter
+predicted_x <- GD_res$xt_prediction[-1,]
+
+Y_res <- GD_res$y_hat - bt_treasury_yields
+Beta_res <- filtered_x - predicted_x
+
+# Compare the SSE 
+colSums(Y_res^2)
+colSums(Beta_res^2)
+sum((Y_res^2))
+GD_res$nll
+```
+
+
+
+
+```{r}
+log_returns <- apply(bt_treasury_yields, 2, function(x) diff(log(x)))
+head(log_returns)
+rownames(filtered_x) <-  times
+latent_log_returns <- apply(filtered_x, 2, function(x) diff(log(abs(x))))
+head(latent_log_returns)
+
+```
+
+
+
+```{r}
+Bond_RV_array <- get_RV(log_returns, latent_log_returns, tenors_bt, times)
+dim(Bond_RV_array)
+RV_mat_x <- as.matrix(Bond_RV_array[ , 2:10, 1])
+RV_mat_y <- as.matrix(Bond_RV_array[ ,1 , ])
+
+```
+
+```{r}
+par(mfrow = c(2, 2))  
+RV_y_names <- c("RV_1_year", "RV_5_year", "RV_10_year" ,"RV_20_year")
+for (i in 1:4) {
+  plot(RV_mat_y[, i],
+       type = "l",
+       col = "blue",
+       lwd = 2,
+       xlab = "Time",
+       ylab = "RV_y",
+       main = RV_y_names[i])
+}
+
+par(mfrow = c(1, 1))  # Reset layout
+
+```
+```{r}
+RV_y_names <- c("RV_1_year", "RV_5_year", "RV_10_year", "RV_20_year")
+
+matplot(RV_mat_y[, 1:4], type = "l", lwd = 2, lty = 1,
+        col = c("blue", "red", "green", "purple"),
+        xlab = "Time", ylab = "Realized Volatility",
+        main = "Realized Volatility of Yields")
+legend("topright", legend = RV_y_names,
+       col = c("blue", "red", "green", "purple"), lty = 1, lwd = 2)
+
+```
+
+
+
+```{r}
+par(mfrow = c(3, 3))  # Set 3x3 plotting area
+
+RV_x_names <- c("RV_level_week", "RV_slope_week", "RV_curvature_week" 
+  ,"RV_level_month", "RV_slope_month", "RV_curvature_month"
+  ,"RV_level_quarter", "RV_slope_quarter", "RV_curvature_quarter" )
+for (i in 1:9) {
+  plot(RV_mat_x[, i],
+       type = "l",
+       col = "blue",
+       lwd = 1,
+       xlab = "Time",
+       ylab = "RV_x",
+       main = RV_x_names[i])
+}
+
+```
+```{r}
+# Set up 3 plots side by side
+par(mfrow = c(1, 3))
+
+# Define color scheme
+colors <- c("blue", "red", "green")
+
+# Group 1: RV_level_week, RV_slope_week, RV_curvature_week
+matplot(RV_mat_x[, 1:3], type = "l", lty = 1, lwd = 2, col = colors,
+        xlab = "Time", ylab = "RV_x", main = "Weekly RV")
+legend("topright", legend = RV_x_names[1:3], col = colors, lty = 1, lwd = 2)
+
+# Group 2: RV_level_month, RV_slope_month, RV_curvature_month
+matplot(RV_mat_x[, 4:6], type = "l", lty = 1, lwd = 2, col = colors,
+        xlab = "Time", ylab = "RV_x", main = "Monthly RV")
+legend("topright", legend = RV_x_names[4:6], col = colors, lty = 1, lwd = 2)
+
+# Group 3: RV_level_quarter, RV_slope_quarter, RV_curvature_quarter
+matplot(RV_mat_x[, 7:9], type = "l", lty = 1, lwd = 2, col = colors,
+        xlab = "Time", ylab = "RV_x", main = "Quarterly RV")
+legend("topright", legend = RV_x_names[7:9], col = colors, lty = 1, lwd = 2)
+
+# Reset plot layout
+par(mfrow = c(1, 1))
+
+```
+```{r}
+# Set 3 plots side by side
+par(mfrow = c(1, 3))
+
+# Define colors for time scales
+colors <- c("blue", "red", "green")
+time_labels <- c("Week", "Month", "Quarter")
+
+# Group 1: Level
+matplot(RV_mat_x[, c(1, 4, 7)], type = "l", lty = 1, lwd = 2, col = colors,
+        xlab = "Time", ylab = "RV_x", main = "RV Level")
+legend("topright", legend = paste("Level", time_labels), col = colors, lty = 1, lwd = 2)
+
+# Group 2: Slope
+matplot(RV_mat_x[, c(2, 5, 8)], type = "l", lty = 1, lwd = 2, col = colors,
+        xlab = "Time", ylab = "RV_x", main = "RV Slope")
+legend("topright", legend = paste("Slope", time_labels), col = colors, lty = 1, lwd = 2)
+
+# Group 3: Curvature
+matplot(RV_mat_x[, c(3, 6, 9)], type = "l", lty = 1, lwd = 2, col = colors,
+        xlab = "Time", ylab = "RV_x", main = "RV Curvature")
+legend("topright", legend = paste("Curvature", time_labels), col = colors, lty = 1, lwd = 2)
+
+# Reset plotting layout
+par(mfrow = c(1, 1))
+
+```
+
+
+```{r}
+RV_mat_x[540:600,8]
+latent_log_returns[543:564, 1]
+latent_log_returns[543:564, 2]
+latent_log_returns[543:564, 3]
+latent_RV_month <- as.data.frame(latent_log_returns) %>%
+  mutate(month = floor_date(as.Date(rownames(latent_log_returns)), "month")) %>%
+  group_by(month) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+
+a <- as.data.frame(latent_log_returns) %>%
+  mutate(month = floor_date(as.Date(rownames(latent_log_returns)), "month")) %>%
+  group_by(month) 
+a %>% summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+sum(a[1:21, 2]^2)
+
+latent_log_returns[543:564, 2]
+filtered_x[543:564,2]
+```
+```{r}
+log_returns[543:564, 2]
+
+latent_RV_quarter <- as.data.frame(latent_log_returns) %>%
+  mutate(quarter = floor_date(as.Date(rownames(latent_log_returns)), "quarter")) %>%
+  group_by(quarter) %>%
+  summarise(across(where(is.numeric), ~sum(.^2, na.rm = TRUE)))
+```
+
+
+
+```{r, message = FALSE}
+training_name<- c("RV_y", "RV_level_day", "RV_level_week", "RV_level_month",
+  "RV_slope_day", "RV_slope_week", "RV_slope_month",
+  "RV_curvature_day", "RV_curvature_week", "RV_curvature_month")
+RV_trans_col_names <- c("RV_level_day", "RV_level_week", "RV_level_month",
+  "RV_slope_day", "RV_slope_week", "RV_slope_month",
+  "RV_curvature_day", "RV_curvature_week", "RV_curvature_month")
+
+RV_trans_mat <- matrix(NA, length(tenors_bt), 9)
+colnames(RV_trans_mat) <- RV_trans_col_names
+
+RV_itcp_mat <- matrix(NA, length(tenors_bt), 1)
+for(i in 1:length(tenors_bt)){
+  data <- Bond_RV_array[,,i]
+  data_adj <- cbind(Bond_RV_array[-1,1,i], Bond_RV_array[-nrow(Bond_RV_array),2:ncol(Bond_RV_array),i])
+  colnames(data_adj) <- training_name
+  model <- lm(RV_y ~., data = as.data.frame(data_adj))
+  coef <- stepAIC(model, direction = "backward")$coefficient
+  RV_trans_mat[i, names(coef[2: length(coef)])] <- coef[2: length(coef)]
+  
+  RV_itcp_mat[i,] <- coef[1]
+}
+
+RV_trans_mat[is.na(RV_trans_mat)] <- 0
+RV_itcp_mat[is.na(RV_itcp_mat)] <- 0
+```
+
+
+```{r, message = FALSE}
+RV_trans_mat
+RV_itcp_mat
+
+```
+
+
+
+```{r}
+
+KF_HAR_result <- KF_NS_HAR(parameters, bt_treasury_yields, mats_matrix_real, 0.1, RV_itcp, RV_trans, scale = 5000) 
+#KF_HAR_result$
+``` 
+
+
+```{r}
+filtered_x_HAR <- KF_HAR_result$xt_filter
+predicted_x_HAR <- KF_HAR_result$xt_prediction[-1,]
+
+Y_res_HAR <- KF_HAR_result$y_hat - bt_treasury_yields
+Beta_res_HAR <- filtered_x_HAR - predicted_x_HAR
+
+# Compare the SSE 
+sum((Y_res_HAR^2))
+colSums(Y_res_HAR^2)
+
+sum(Y_res^2)
+colSums(Y_res^2)
+
+```
+
+
+```{r}
+plot_kf_x(KF_HAR_result)
+plot_kf_yield_y(KF_HAR_result, bt_treasury_yields, tenors_bt)
+
+```
+
+
+
+```{r}
+plot_kf_x <- function(kf_result, n_obs = NULL, state_names = c("Level", "Slope", "Curvature")) {
+  if (is.null(n_obs)) {
+    n_obs <- nrow(kf_result$xt_filter)
+  }
+
+  for (i in 1:3) {
+    df_real <- data.frame(
+      Time = 1:n_obs,
+      KF_Filtered = kf_result$xt_filter[, i],
+      KF_Predicted = kf_result$xt_prediction[-1, i],  # skip first row to align dimensions
+      CI_Upper = kf_result$xt_filter[, i] + 1.96 * sqrt(kf_result$Pt_filter[i, i, ]),
+      CI_Lower = kf_result$xt_filter[, i] - 1.96 * sqrt(kf_result$Pt_filter[i, i, ])
+    )
+
+    p <- ggplot(df_real, aes(x = Time)) +
+      geom_line(aes(y = KF_Filtered, color = "Filtered"), size = 1) +
+      geom_line(aes(y = KF_Predicted, color = "Predicted"), size = 1, linetype = "dashed") +
+      geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +
+      labs(title = paste("Kalman Filter -", state_names[i]),
+           y = state_names[i],
+           x = "Time") +
+      scale_color_manual(values = c("Filtered" = "red", "Predicted" = "black")) +
+      theme_minimal()
+
+    print(p)
+  }
+}
+
+
+plot_kf_yield_y <- function(kf_result, y_real, tenors, times = NULL) {
+  # Inputs:
+  #   kf_result: list containing 'y_hat' and 'cov_y' from Kalman Filter output
+  #   y_real: matrix or data.frame of real observed yields
+  #   tenors: numeric vector of tenors (e.g., c(0.25, 0.5, 1, 2, ...))
+  #   times: optional vector of actual dates for x-axis labels (defaults to 1:n)
+  
+  y_hat <- kf_result$y_hat
+  y_cov <- kf_result$cov_y
+
+  n_obs <- nrow(y_hat)
+  n_contract <- ncol(y_hat)
+
+  if (is.null(times)) {
+    times <- 1:n_obs
+  }
+
+  # Compute confidence intervals
+  ci_upper <- matrix(NA, n_obs, n_contract)
+  ci_lower <- matrix(NA, n_obs, n_contract)
+  for (i in 1:n_obs) {
+    std_err <- sqrt(diag(y_cov[,,i]))
+    ci_upper[i, ] <- y_hat[i, ] + 1.96 * std_err
+    ci_lower[i, ] <- y_hat[i, ] - 1.96 * std_err
+  }
+
+  # Plot for each tenor
+  for (i in 1:n_contract) {
+    df <- data.frame(
+      Time = 1:n_obs,
+      Real = y_real[, i],
+      Predicted = y_hat[, i],
+      CI_Upper = ci_upper[, i],
+      CI_Lower = ci_lower[, i]
+    )
+    colnames(df) <- c("Time", "Real","Predicted","CI_Upper","CI_Lower")
+
+    plot <- ggplot(df, aes(x = Time)) +
+      geom_line(aes(y = Real, color = "Real Data"), size = 1) +
+      geom_line(aes(y = Predicted, color = "Predicted Data"), size = 1, linetype = "dashed") +
+      geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "blue", alpha = 0.2) +
+      labs(
+        title = paste("Kalman Filter Prediction vs Real Data - Tenor", tenors[i]),
+        y = paste("Yield (Tenor =", tenors[i], "years)"),
+        x = "Time"
+      ) +
+      scale_color_manual(
+        name = "Legend",
+        values = c("Real Data" = "black", "Predicted Data" = "red")
+      ) +
+      scale_x_continuous(
+        breaks = seq(1, n_obs, length.out = 5),
+        labels = format(times[seq(1, n_obs, length.out = 5)])
+      ) +
+      ylim(0, 10)+
+      theme_minimal()
+
+    print(plot)
+  }
+}
+```
+
+
+
+
+
+
+
+
+
+
